@@ -143,6 +143,7 @@ def hardened() -> dict:
         "getNetworkApplianceSecurityMalware": {"mode": "enabled"},
         "getNetworkApplianceContentFiltering": {"blockedUrlCategories": [{"id": "x", "name": "Malware sites"}]},
         "getNetworkApplianceSettings": {"deploymentMode": "routed"},
+        "getNetworkApplianceFirewallSettings": {"spoofingProtection": {"ipSourceGuard": {"mode": "block"}}},
         "getNetworkWirelessSsids": [
             {"number": 0, "name": "Corp", "enabled": True, "authMode": "8021x-radius",
              "encryptionMode": "wpa-eap", "wpaEncryptionMode": "WPA3 Transition Mode",
@@ -153,27 +154,30 @@ def hardened() -> dict:
         "getNetworkWirelessSsidFirewallL3FirewallRules": {"allowLanAccess": False, "rules": []},
         "getNetworkSwitchStp": {"rstpEnabled": True},
         "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "block", "alerts": {"email": {"enabled": True}}},
-        "getNetworkSwitchAccessPolicies": [{"name": "dot1x"}],
+        "getNetworkSwitchAccessPolicies": [{
+            "name": "dot1x", "accessPolicyType": "802.1x", "hostMode": "Multi-Domain",
+            "radiusServers": [{"host": "10.1.1.3"}, {"host": "10.2.1.3"}],
+            "radiusAccountingEnabled": True,
+            "radius": {"criticalAuth": {"dataVlanId": None}, "failedAuthVlanId": None}}],
     }
 
 
 class FakeDashboard:
+    """Returns data[name]; a callable value is called with the request kwargs, an
+    exception value is raised, and an unknown method raises 404."""
+
     def __init__(self, data: dict):
-        def make(name):
-            def fn(*args, **kwargs):
-                if name not in data:
-                    raise NotFound()
-                val = data[name]
-                if isinstance(val, Exception):
-                    raise val
-                return val
-            return fn
-        ns = SimpleNamespace(**{k: make(k) for k in data})
-        self.organizations = self.networks = self.appliance = self.wireless = self.switch = ns
-        # make missing methods raise NotFound instead of AttributeError
-        for attr in ("getOrganizationSamlIdps", "getOrganizationSamlRoles"):
-            if not hasattr(ns, attr):
-                setattr(ns, attr, make(attr))
+        class NS:
+            def __getattr__(_, name):
+                def fn(*args, **kwargs):
+                    if name not in data:
+                        raise NotFound()
+                    val = data[name]
+                    if isinstance(val, Exception):
+                        raise val
+                    return val(*args, **kwargs) if callable(val) else val
+                return fn
+        self.organizations = self.networks = self.appliance = self.wireless = self.switch = NS()
 
 
 def run(data, *args, capsys=None):
@@ -237,3 +241,181 @@ def test_helpers():
     assert ma.parse_time("2019-01-28 14:58:56 -0800").year == 2019
     assert ma.parse_time(0) is None
     assert ma.psk_weakness("Tr0ub4dor&3-Horse-Staple!", "Guest", 12) == []
+
+
+def test_uplink_missing_in_use_vlan(capsys):
+    data = hardened()
+    data["getOrganizationSwitchPortsBySwitch"] = [{"name": "idf1", "network": {"id": "N1"}, "ports": [
+        {"portId": "8", "enabled": True, "type": "trunk", "vlan": 999, "allowedVlans": "10,20,30",
+         "name": "Uplink to core"},
+        {"portId": "9", "enabled": True, "type": "trunk", "vlan": 999, "allowedVlans": "10,40",
+         "name": "AP"},
+        {"portId": "1", "enabled": True, "type": "access", "vlan": 40, "stpGuard": "bpdu guard"},
+        {"portId": "2", "enabled": True, "type": "access", "vlan": 10, "voiceVlan": 50,
+         "stpGuard": "bpdu guard"},
+        {"portId": "3", "enabled": False, "type": "access", "vlan": 60}]}]
+    _, out, ids = run(data, capsys=capsys)
+    trunk = [f for f in out["findings"] if f["check_id"] == "SW-TRUNK-01"]
+    assert len(trunk) == 1 and ids == {"SW-TRUNK-01"}
+    assert trunk[0]["severity"] == "HIGH" and trunk[0]["resource"] == "idf1 port 8"
+    assert "40,50" in trunk[0]["detail"] and "60" not in trunk[0]["detail"]
+
+
+def test_uplink_ambiguous_is_skipped_not_guessed(capsys):
+    data = hardened()
+    data["getOrganizationSwitchPortsBySwitch"] = [{"name": "idf1", "network": {"id": "N1"}, "ports": [
+        {"portId": "8", "enabled": True, "type": "trunk", "vlan": 999, "allowedVlans": "10"},
+        {"portId": "9", "enabled": True, "type": "trunk", "vlan": 999, "allowedVlans": "10"},
+        {"portId": "1", "enabled": True, "type": "access", "vlan": 40, "stpGuard": "bpdu guard"}]}]
+    _, out, ids = run(data, capsys=capsys)
+    assert ids == set()
+    assert any(s["check"] == "switch-uplink-vlans" for s in out["skipped"])
+
+
+def test_single_trunk_is_uplink_and_native_counts(capsys):
+    data = hardened()
+    data["getOrganizationSwitchPortsBySwitch"] = [{"name": "sw", "network": {"id": "N1"}, "ports": [
+        {"portId": "1", "enabled": True, "type": "trunk", "vlan": 10, "allowedVlans": "20"},
+        {"portId": "2", "enabled": True, "type": "access", "vlan": 10, "stpGuard": "bpdu guard"}]}]
+    assert run(data, capsys=capsys)[2] == set()
+
+
+def test_shadowed_firewall_rules(capsys):
+    data = hardened()
+    data["getNetworkApplianceFirewallL3FirewallRules"] = {"rules": [
+        {"comment": "web out", "policy": "allow", "protocol": "tcp", "srcCidr": "10.0.0.0/8",
+         "srcPort": "Any", "destCidr": "Any", "destPort": "80,443", "syslogEnabled": True},
+        {"comment": "block lab web", "policy": "deny", "protocol": "tcp", "srcCidr": "10.9.0.0/16",
+         "srcPort": "Any", "destCidr": "Any", "destPort": "443"},
+        {"comment": "dup", "policy": "allow", "protocol": "tcp", "srcCidr": "10.1.2.3",
+         "srcPort": "Any", "destCidr": "Any", "destPort": "80"},
+        {"comment": "not covered: any port", "policy": "deny", "protocol": "tcp", "srcCidr": "10.9.0.0/16",
+         "srcPort": "Any", "destCidr": "Any", "destPort": "Any"},
+        {"comment": "not covered: VLAN syntax", "policy": "deny", "protocol": "any",
+         "srcCidr": "VLAN(30).*", "destCidr": "Any", "destPort": "Any"},
+        {"comment": "Default rule", "policy": "allow", "protocol": "Any", "srcCidr": "Any", "destCidr": "Any"}]}
+    _, out, ids = run(data, capsys=capsys)
+    fw = sorted((f["resource"], f["severity"]) for f in out["findings"] if f["check_id"] == "MX-FW-05")
+    assert fw == [("rule 2", "MEDIUM"), ("rule 3", "INFO")]
+    assert ids == {"MX-FW-05"}
+
+
+def test_shadow_after_any_any_not_double_reported(capsys):
+    _, out, ids = run(insecure(), capsys=capsys)
+    assert "MX-FW-02" in ids and "MX-FW-05" not in ids
+
+
+def test_rule_covers_edge_cases():
+    r = lambda **kw: {"policy": "allow", "protocol": "any", "srcCidr": "Any", "destCidr": "Any",
+                      "srcPort": "Any", "destPort": "Any", **kw}
+    assert ma.rule_covers(r(destPort="1-1024"), r(protocol="udp", destPort="53"))
+    assert not ma.rule_covers(r(protocol="tcp"), r(protocol="udp"))
+    assert not ma.rule_covers(r(destPort="1-1024"), r(destPort="1000-2000"))
+    assert ma.rule_covers(r(srcCidr="10.0.0.0/8,192.168.0.0/16"), r(srcCidr="192.168.1.0/24,10.5.0.0/16"))
+    assert not ma.rule_covers(r(srcCidr="10.0.0.0/8"), r(srcCidr="10.0.0.0/8,172.16.0.0/12"))
+    assert ma.rule_covers(r(protocol="icmp", srcCidr="10.0.0.0/8"), r(protocol="icmp", srcCidr="10.1.1.1"))
+    assert not ma.rule_covers(r(destPort="weird"), r(destPort="80"))
+
+
+def test_access_policy_design(capsys):
+    data = hardened()
+    data["getNetworkSwitchAccessPolicies"] = [{
+        "name": "desks", "accessPolicyType": "Hybrid authentication", "hostMode": "Multi-Host",
+        "radiusServers": [{"host": "10.1.1.3"}], "radiusAccountingEnabled": False,
+        "radius": {"criticalAuth": {"dataVlanId": 10}}}]
+    _, out, ids = run(data, capsys=capsys)
+    assert ids == {"SW-NAC-02", "SW-NAC-03", "SW-NAC-04", "SW-NAC-05"}
+    assert "10.1.1.3" in json.dumps(out)
+
+
+def test_vlan_helpers():
+    assert ma.parse_vlans("all") is None and ma.parse_vlans("1-4094") is None
+    assert ma.parse_vlans("1,10-12") == {1, 10, 11, 12}
+    assert ma.compact_vlans({40, 10, 11, 12, 50}) == "10-12,40,50"
+
+
+def test_spoofing_protection_log_only(capsys):
+    data = hardened()
+    data["getNetworkApplianceFirewallSettings"] = {"spoofingProtection": {"ipSourceGuard": {"mode": "log"}}}
+    assert run(data, capsys=capsys)[2] == {"MX-SPOOF-01"}
+
+
+def with_admin_ids(data, keys=False):
+    data["getOrganizationAdmins"][0].update(id="A1", hasApiKey=keys)
+    data["getOrganizationAdmins"][1].update(id="B1", hasApiKey=keys)
+    return data
+
+
+def test_api_usage(capsys):
+    data = with_admin_ids(hardened(), keys=True)
+    calls = []
+
+    def api_requests(org_id, **kw):
+        calls.append(kw)
+        if kw.get("adminId") == "A1":
+            return []
+        if kw.get("adminId") == "B1":
+            return [{"adminId": "B1", "method": "GET"}]
+        if kw.get("method") == "POST":
+            return [{"adminId": "B1", "method": "POST", "sourceIp": "198.51.100.7", "userAgent": "terraform"}] * 3
+        if kw.get("method") == "PUT":
+            return [{"adminId": "X9", "method": "PUT", "sourceIp": "203.0.113.9", "userAgent": "curl"}]
+        if kw.get("version") == 0:
+            return [{"adminId": "B1", "userAgent": "legacy-script"}]
+        return []
+
+    data["getOrganizationApiRequests"] = api_requests
+    _, out, ids = run(data, "--log-days", "90", capsys=capsys)
+    assert ids - {"ORG-ADM-06"} == {"ORG-API-01", "ORG-API-02", "ORG-API-03"}
+    by = {(f["check_id"], f["resource"]): f for f in out["findings"]}
+    assert by[("ORG-API-01", "a@acme.com")]["severity"] == "MEDIUM"
+    assert ("ORG-API-01", "b@acme.com") not in by
+    assert by[("ORG-API-02", "b@acme.com")]["severity"] == "INFO"
+    assert "POST 3" in by[("ORG-API-02", "b@acme.com")]["detail"]
+    assert "198.51.100.7" in by[("ORG-API-02", "b@acme.com")]["detail"]
+    assert by[("ORG-API-02", "X9")]["severity"] == "LOW"
+    assert all(c["timespan"] == 31 * 86400 for c in calls)  # API log keeps 31 days
+
+
+def changes_fixture():
+    return [
+        {"ts": "2026-11-20T10:00:00Z", "adminId": "A1", "adminEmail": "a@acme.com",
+         "page": "Organization settings", "label": "Two-factor authentication",
+         "oldValue": "true", "newValue": "false"},
+        {"ts": "2026-11-19T10:00:00Z", "adminId": "G1", "adminEmail": "gone@acme.com",
+         "page": "Firewall", "label": "L3 firewall rules", "networkId": "N1", "networkName": "HQ",
+         "oldValue": "[]", "newValue": "[...]"},
+        {"ts": "2026-11-18T10:00:00Z", "adminId": "V1", "adminEmail": "x@vendor.io",
+         "page": "Access control", "label": "PSK", "networkId": "N1", "networkName": "HQ",
+         "oldValue": "OldSecretPsk123", "newValue": "NewSecretPsk456"},
+        {"ts": "2026-11-17T10:00:00Z", "adminId": "A1", "adminEmail": "a@acme.com",
+         "page": "Network-wide settings", "label": "Syslog servers", "networkId": "N9",
+         "networkName": "Other", "oldValue": "x", "newValue": "y"},
+        {"ts": "2026-11-16T10:00:00Z", "adminId": "A1", "adminEmail": "a@acme.com",
+         "page": "Switch ports", "label": "Port name", "networkId": "N1", "networkName": "HQ",
+         "oldValue": "a", "newValue": "b"},
+    ]
+
+
+def test_config_changes(capsys):
+    data = with_admin_ids(hardened())
+    data["getOrganizationConfigurationChanges"] = changes_fixture()
+    _, out, ids = run(data, "--trusted-domain", "acme.com", capsys=capsys)
+    assert ids == {"ORG-CHG-01", "ORG-CHG-02", "ORG-CHG-03", "ORG-CHG-04"}
+    f = {(x["check_id"], x["resource"]): x for x in out["findings"]}
+    assert "Two-factor" in f[("ORG-CHG-01", "")]["detail"]
+    # SAML is enabled in the hardened fixture, so unknown admins are only INFO
+    assert f[("ORG-CHG-02", "gone@acme.com")]["severity"] == "INFO"
+    assert f[("ORG-CHG-03", "x@vendor.io")]["severity"] == "MEDIUM"
+    areas = {r for (c, r) in f if c == "ORG-CHG-04"}
+    assert areas == {"Identity & access", "Firewall & threat protection",
+                     "Logging & monitoring", "Wireless & port authentication"}
+    blob = json.dumps(out)
+    assert "SecretPsk" not in blob and "Port name" not in blob
+
+
+def test_config_changes_respect_network_filter(capsys):
+    data = with_admin_ids(hardened())
+    data["getOrganizationConfigurationChanges"] = changes_fixture()
+    _, out, _ = run(data, "--network-id", "N1", capsys=capsys)
+    assert "Syslog" not in json.dumps(out)
