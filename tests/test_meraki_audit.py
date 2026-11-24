@@ -84,6 +84,12 @@ def insecure() -> dict:
             {"number": 3, "name": "Unconfigured SSID 4", "enabled": False, "authMode": "open"},
         ],
         "getNetworkWirelessSsidFirewallL3FirewallRules": {"allowLanAccess": True, "rules": []},
+        "getNetworkWirelessBluetoothSettings": {"scanningEnabled": True, "advertisingEnabled": True},
+        "getNetworkWirelessEthernetPortsProfiles": [
+            {"profileId": "1", "name": "Default", "isDefault": True, "ports": [],
+             "usbPorts": [{"name": "usb port", "enabled": True}]},
+            {"profileId": "2", "name": "Locked", "isDefault": False, "ports": [],
+             "usbPorts": [{"name": "usb port", "enabled": False}]}],
         "getNetworkSwitchStp": {"rstpEnabled": False},
         "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "allow", "alerts": {"email": {"enabled": False}}},
         "getNetworkSwitchAccessPolicies": [],
@@ -152,6 +158,10 @@ def hardened() -> dict:
              "wpaEncryptionMode": "WPA2 only", "psk": "Tr0ub4dor&3-Horse-Staple!", "ipAssignmentMode": "NAT mode"},
         ],
         "getNetworkWirelessSsidFirewallL3FirewallRules": {"allowLanAccess": False, "rules": []},
+        "getNetworkWirelessBluetoothSettings": {"scanningEnabled": False, "advertisingEnabled": False},
+        "getNetworkWirelessEthernetPortsProfiles": [
+            {"profileId": "1", "name": "Default", "isDefault": True, "ports": [],
+             "usbPorts": [{"name": "usb port", "enabled": False}]}],
         "getNetworkSwitchStp": {"rstpEnabled": True},
         "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "block", "alerts": {"email": {"enabled": True}}},
         "getNetworkSwitchAccessPolicies": [{
@@ -199,7 +209,8 @@ def test_insecure_org_flags_expected_issues(capsys):
         "FW-02", "FW-03", "MX-FW-01", "MX-FW-02", "MX-NAT-01", "MX-NAT-02", "MX-SVC-01", "MX-SVC-02",
         "MX-IPS-01", "MX-AMP-01", "MX-CF-01",
         "WL-SSID-01", "WL-SSID-02", "WL-SSID-04", "WL-SSID-05", "WL-SSID-06", "WL-SSID-07",
-        "WL-SSID-08", "WL-SSID-10", "SW-STP-01", "SW-DHCP-01", "SW-DHCP-02", "SW-NAC-01",
+        "WL-SSID-08", "WL-SSID-10", "WL-BT-01", "WL-BT-02", "WL-USB-01",
+        "SW-STP-01", "SW-DHCP-01", "SW-DHCP-02", "SW-NAC-01",
     }
     assert expected - ids == set(), f"missing: {sorted(expected - ids)}"
     # disabled SSIDs are ignored
@@ -419,3 +430,10 @@ def test_config_changes_respect_network_filter(capsys):
     data["getOrganizationConfigurationChanges"] = changes_fixture()
     _, out, _ = run(data, "--network-id", "N1", capsys=capsys)
     assert "Syslog" not in json.dumps(out)
+
+
+def test_ap_usb_reports_only_enabled_profiles(capsys):
+    _, out, _ = run(insecure(), "--network-tag", "prod", capsys=capsys)
+    usb = [f for f in out["findings"] if f["check_id"] == "WL-USB-01"]
+    assert [f["resource"] for f in usb] == ["Default"]
+    assert "default profile" in usb[0]["detail"]

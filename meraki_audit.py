@@ -1305,6 +1305,40 @@ def check_ssids(s: Scope) -> None:
                       "Deny LAN access on the SSID's L3 firewall for guest networks.", resource=name)
 
 
+def check_ap_bluetooth(s: Scope) -> None:
+    bt = s.call("ap-bluetooth", s.d.wireless.getNetworkWirelessBluetoothSettings, s.net["id"])
+    if not bt:
+        return
+    cat = "Wireless"
+    if bt.get("scanningEnabled"):
+        s.add("LOW", "WL-BT-01", cat, "AP Bluetooth scanning enabled",
+              "Access points scan for nearby Bluetooth/BLE devices and report them to Dashboard.",
+              "Disable Bluetooth scanning (Wireless > Bluetooth settings) unless it is used "
+              "for location analytics or asset tracking.")
+    if bt.get("advertisingEnabled"):
+        s.add("LOW", "WL-BT-02", cat, "AP BLE beacon advertising enabled",
+              "Access points broadcast BLE iBeacon advertisements.",
+              "Disable beacon advertising unless an app relies on it.")
+
+
+def check_ap_usb(s: Scope) -> None:
+    profiles = s.call("ap-usb-ports", s.d.wireless.getNetworkWirelessEthernetPortsProfiles,
+                      s.net["id"])
+    if not profiles:
+        return
+    for p in profiles:
+        enabled = [u.get("name") or "USB" for u in (p.get("usbPorts") or []) if u.get("enabled")]
+        if not enabled:
+            continue
+        name = p.get("name") or f"profile {p.get('profileId')}"
+        aps = len(p.get("assignments") or [])
+        scope = "default profile" if p.get("isDefault") else f"assigned to {aps} AP(s)"
+        s.add("LOW", "WL-USB-01", "Wireless", "AP USB port enabled",
+              f"AP port profile '{name}' ({scope}) has enabled USB port(s): {_short(enabled)}.",
+              "Disable the AP USB port in the port profile unless a USB device is required.",
+              resource=name)
+
+
 # --------------------------------------------------------------------------- #
 # Switch (MS) checks
 # --------------------------------------------------------------------------- #
@@ -1393,6 +1427,8 @@ NETWORK_CHECKS: list[tuple[str | None, Callable[[Scope], None]]] = [
     ("appliance", check_mx_mode),
     ("appliance", check_mx_spoofing),
     ("wireless", check_ssids),
+    ("wireless", check_ap_bluetooth),
+    ("wireless", check_ap_usb),
     ("switch", check_switch_network),
 ]
 

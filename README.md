@@ -67,7 +67,7 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
 | **VPN** | 3rd-party peers: IKEv1, default (weak) IPsec preset, DES/3DES/MD5/SHA1/DH 1/2/5, short PSK, scoping; site-to-site VPN firewall rules, including rules hidden by an earlier rule |
 | **MX firewall** | any/any allow rules, rules that never match because an earlier rule covers them (conflicting → MEDIUM, redundant → INFO), no deny rules, undocumented rules, no syslog on rules, inbound rules from any source, port forwards / 1:1 / 1:many NAT open to the internet (sensitive ports → HIGH), WAN web/SNMP services unrestricted, passthrough mode, IP spoofing protection not set to block |
 | **MX threat protection** | IDS/IPS disabled or detection-only, weak ruleset, AMP disabled, no blocked URL categories |
-| **Wireless** | WEP, open SSIDs, WPA1/TKIP, weak PSKs, shared PSK on bridged SSIDs, guest SSIDs bridged into LAN, no client isolation, guest LAN access allowed, 802.1X without RADIUS, Air Marshal default policy |
+| **Wireless** | WEP, open SSIDs, WPA1/TKIP, weak PSKs, shared PSK on bridged SSIDs, guest SSIDs bridged into LAN, no client isolation, guest LAN access allowed, 802.1X without RADIUS, Air Marshal default policy, AP Bluetooth scanning / BLE beacon advertising on, AP USB ports enabled in port profiles |
 | **Switching** | uplink trunk missing VLANs used by the switch's access ports, RSTP disabled, rogue DHCP not blocked / no alert, no 802.1X policies, 802.1X Multi-Host mode, fewer than two RADIUS servers, RADIUS accounting off, fail-open critical-auth VLAN, trunks allowing all VLANs, native VLAN 1, access ports in VLAN 1, no BPDU guard |
 | **Management plane** | local status page without auth, remote status page access |
 | **Logging & monitoring** | no syslog server, security events not sent to syslog, no alert recipients, security alerts disabled |
@@ -84,6 +84,10 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
   covers everything, a CIDR covers its subnets, ports compare as sets, and anything else
   (`VLAN(30).*`, FQDNs) must match exactly. Shadowing written in different notations is
   missed, but it is not invented.
+- **AP USB ports (`WL-USB-01`)**: read from the AP port profiles, which only exist for AP
+  models with configurable ports. Networks without such APs are skipped (shown with `-v`), so
+  no finding there does not prove a USB port is disabled. Bluetooth (`WL-BT-01/02`) is a
+  network-wide setting and covers every AP in the network.
 
 Severities are `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`. Each finding has a stable `check_id`
 (e.g. `MX-NAT-01`) so you can track or suppress it in downstream tooling.
