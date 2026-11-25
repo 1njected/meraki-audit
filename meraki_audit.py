@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 try:
     import meraki
@@ -116,6 +117,7 @@ class AuditConfig:
     firmware_max_age_days: int = 365
     log_days: int = 30
     trusted_domains: list[str] = field(default_factory=list)
+    trusted_webhook_domains: list[str] = field(default_factory=list)
 
 
 class Collector:
@@ -1124,6 +1126,133 @@ def check_alerts(s: Scope) -> None:
               "Enable these alerts so changes and threats are noticed.")
 
 
+def webhook_host(url: Any) -> tuple[str, str, str]:
+    """(scheme, hostname, "scheme://host[:port]") of a webhook URL. Only these are ever
+    reported: the path, query and user info of webhook URLs often carry tokens (Slack,
+    Teams, SIEM collectors)."""
+    try:
+        u = urlsplit(str(url or "").strip())
+        host = (u.hostname or "").lower()
+        port = u.port
+    except ValueError:
+        return "", "", "?"
+    if not host:
+        return u.scheme.lower(), "", "?"
+    shown = f"[{host}]" if ":" in host else host
+    scheme = u.scheme.lower()
+    return scheme, host, f"{scheme}://{shown}{f':{port}' if port else ''}"
+
+
+def _host_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def _host_trusted(host: str, domains: list[str]) -> bool:
+    ip = _host_ip(host)
+    if ip is not None:
+        return not ip.is_global  # internal receiver
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def check_webhooks(s: Scope) -> None:
+    """Webhook receivers (HTTP servers) that alerts are POSTed to. The API never returns
+    the shared secret, so only the payload template is checked for sending it."""
+    servers = s.call("webhooks", s.d.networks.getNetworkWebhooksHttpServers, s.net["id"])
+    servers = [h for h in servers or [] if h.get("enabled", True) is not False]
+    if not servers:
+        return
+    cat = "Logging & Monitoring"
+    templates = s.call("webhook-templates", s.d.networks.getNetworkWebhooksPayloadTemplates,
+                       s.net["id"])
+    by_tid = {t.get("payloadTemplateId"): t for t in templates or []}
+    alerts = s.call("alerts", s.d.networks.getNetworkAlertsSettings, s.net["id"])
+    used: set[str] | None = None
+    if alerts is not None:
+        used = set((alerts.get("defaultDestinations") or {}).get("httpServerIds") or [])
+        for a in alerts.get("alerts") or []:
+            if a.get("enabled"):
+                used |= set((a.get("alertDestinations") or {}).get("httpServerIds") or [])
+
+    for h in servers:
+        scheme, host, shown = webhook_host(h.get("url"))
+        res = h.get("name") or shown
+        where = f"Webhook '{res}' posts to {shown}."
+        ip = _host_ip(host)
+        if scheme == "http":
+            internal = ip is not None and not ip.is_global
+            s.add("MEDIUM" if internal else "HIGH", "NET-HOOK-01", cat,
+                  "Webhook receiver uses plain HTTP",
+                  "Alert payloads (device names, client MACs and IPs, admin emails, the shared "
+                  "secret) are sent unencrypted and can be read or changed on the path.",
+                  "Use an https:// URL for the receiver.", resource=res, item=where)
+        tpl = by_tid.get((h.get("payloadTemplate") or {}).get("payloadTemplateId"))
+        if tpl and lower(tpl.get("type")) == "custom":
+            text = (str(tpl.get("body") or "") + " " +
+                    " ".join(f"{x.get('name')} {x.get('template')}" for x in tpl.get("headers") or []))
+            if "sharedsecret" not in text.lower():
+                s.add("MEDIUM", "NET-HOOK-02", cat, "Webhook payload does not include the shared secret",
+                      "Its custom payload template does not use {{sharedSecret}} in the body or "
+                      "headers, so the receiver cannot tell real Meraki alerts from forged ones.",
+                      "Set a shared secret on the HTTP server and send it in the template (e.g. "
+                      "an 'Authorization: Bearer {{sharedSecret}}' header); have the receiver "
+                      "reject requests without it.", resource=res,
+                      item=f"{where[:-1]} with template '{tpl.get('name')}'.")
+        if s.cfg.trusted_webhook_domains and not _host_trusted(host, s.cfg.trusted_webhook_domains):
+            s.add("MEDIUM", "NET-HOOK-03", cat, "Webhook receiver outside trusted domains",
+                  "Alert data is sent to a host that is not in --trusted-webhook-domain.",
+                  "Confirm the receiver is a known, contracted service. Otherwise remove it.",
+                  resource=res, item=where)
+        elif not s.cfg.trusted_webhook_domains and ip is not None and ip.is_global:
+            s.add("INFO", "NET-HOOK-05", cat, "Webhook receiver addressed by public IP",
+                  "Receivers addressed by a bare public IP are often test endpoints left behind, "
+                  "and the TLS certificate cannot be checked against a name.",
+                  "Use a DNS name with a valid certificate, or remove the receiver.",
+                  resource=res, item=where)
+        if used is not None and h.get("id") not in used:
+            s.add("INFO", "NET-HOOK-04", cat, "Webhook receiver not used by network alerts",
+                  "No enabled network alert and no default destination sends to it (sensor or "
+                  "camera alert profiles can still use it).",
+                  "Remove receivers that are no longer needed.", resource=res, item=where)
+
+
+def check_webhook_logs(s: Scope, network_names: dict[str, str], filtered: bool) -> None:
+    """Failed webhook deliveries in the org webhook log: alerts that never arrived."""
+    days = max(1, min(s.cfg.log_days, 30))  # the webhook log keeps 30 days
+    logs = s.call("webhook-logs", s.d.organizations.getOrganizationWebhooksLogs, s.org["id"],
+                  timespan=days * 86400, perPage=1000, total_pages=5)
+    if not logs:
+        return
+    stats: dict[tuple[str, str], list[int]] = {}  # (networkId, receiver) -> [sent, failed]
+    codes: dict[tuple[str, str], set[str]] = {}
+    for e in logs:
+        nid = str(e.get("networkId") or "")
+        if filtered and nid and nid not in network_names:
+            continue
+        key = (nid, webhook_host(e.get("url"))[2])
+        st = stats.setdefault(key, [0, 0])
+        st[0] += 1
+        code = e.get("responseCode")
+        if not (isinstance(code, int) and 200 <= code < 300):
+            st[1] += 1
+            codes.setdefault(key, set()).add(str(code or "no response"))
+    for (nid, recv), (sent, failed) in sorted(stats.items()):
+        if not failed:
+            continue
+        net = network_names.get(nid, nid)
+        s.add("MEDIUM" if failed == sent else "LOW", "ORG-HOOK-01", "Logging & Monitoring",
+              "Webhook deliveries failing",
+              "Alerts sent to this receiver were not accepted, so they were lost unless "
+              "another destination also got them.",
+              "Check the receiver is up and accepts the payload, or fix/remove the webhook.",
+              resource=f"{recv} [{net}]" if net else recv,
+              item=f"{failed} of {sent} webhook(s) to {recv}"
+                   f"{f' from network {net}' if net else ''} failed in the last {days} days "
+                   f"(responses: {', '.join(sorted(codes.get((nid, recv), set())))}).")
+
+
 def check_firmware(s: Scope) -> None:
     fw = s.call("firmware", s.d.networks.getNetworkFirmwareUpgrades, s.net["id"])
     if not fw:
@@ -1623,6 +1752,7 @@ NETWORK_CHECKS: list[tuple[str | None, Callable[[Scope], None]]] = [
     (None, check_network_snmp),
     (None, check_syslog),
     (None, check_alerts),
+    (None, check_webhooks),
     (None, check_firmware),
     ("appliance", check_mx_l3_firewall),
     ("appliance", check_mx_inbound),
@@ -1678,6 +1808,7 @@ def audit_org(dashboard, cfg: AuditConfig, out: Collector, org: dict,
     names = {n["id"]: n["name"] for n in networks}
     changes = check_config_changes(s, admins, saml, names if (network_ids or network_tags) else None)
     check_support_access(s, changes)
+    check_webhook_logs(s, names, bool(network_ids or network_tags))
 
     if any("wireless" in n.get("productTypes", []) for n in networks):
         check_air_marshal(s, names)
@@ -1904,6 +2035,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Exit with code 2 if any finding is at or above this severity")
     p.add_argument("--trusted-domain", action="append", default=[],
                    help="Admin email domain considered internal (repeatable)")
+    p.add_argument("--trusted-webhook-domain", action="append", default=[],
+                   help="Domain webhook receivers may post to, incl. subdomains (repeatable; "
+                        "private IPs always count as trusted)")
     p.add_argument("--inactive-days", type=int, default=90,
                    help="Flag admins inactive longer than this")
     p.add_argument("--max-full-admins", type=int, default=5)
@@ -1971,6 +2105,7 @@ def main(argv: list[str] | None = None, dashboard=None) -> int:
         firmware_max_age_days=args.firmware_max_age_days,
         log_days=args.log_days,
         trusted_domains=[d.lower().lstrip("@") for d in args.trusted_domain],
+        trusted_webhook_domains=[d.lower().lstrip(".") for d in args.trusted_webhook_domain],
     )
     out = Collector()
     progress = (lambda m: None) if args.quiet else (lambda m: print(m, file=sys.stderr, flush=True))

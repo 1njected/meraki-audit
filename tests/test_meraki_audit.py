@@ -56,6 +56,17 @@ def insecure() -> dict:
         "getNetworkSyslogServers": {"servers": []},
         "getNetworkAlertsSettings": {"defaultDestinations": {"emails": [], "allAdmins": False},
                                      "alerts": [{"type": "settingsChanged", "enabled": False}]},
+        "getNetworkWebhooksHttpServers": [
+            {"id": "h1", "name": "ticketing", "enabled": True,
+             "url": "http://hooks.vendor.io/in/TOKEN123?key=abc",
+             "payloadTemplate": {"payloadTemplateId": "wpt_9", "name": "Mine"}}],
+        "getNetworkWebhooksPayloadTemplates": [
+            {"payloadTemplateId": "wpt_9", "type": "custom", "name": "Mine",
+             "headers": [{"name": "Content-Type", "template": "application/json"}],
+             "body": "{\"alert\": \"{{alertTypeId}}\"}"}],
+        "getOrganizationWebhooksLogs": [
+            {"networkId": "N1", "url": "http://hooks.vendor.io/in/TOKEN123?key=abc", "responseCode": 500},
+            {"networkId": "N1", "url": "http://hooks.vendor.io/in/TOKEN123?key=abc", "responseCode": None}],
         "getNetworkFirmwareUpgrades": {"products": {"appliance": {
             "currentVersion": {"shortName": "MX 16.1", "releaseType": "stable", "releaseDate": "2021-01-01T00:00:00Z"},
             "availableVersions": [{"shortName": "MX 19.1", "releaseType": "stable", "releaseDate": "2025-06-01T00:00:00Z"}]}}},
@@ -131,8 +142,15 @@ def hardened() -> dict:
                                "localStatusPage": {"authentication": {"enabled": True}}},
         "getNetworkSnmp": {"access": "users"},
         "getNetworkSyslogServers": {"servers": [{"host": "10.1.1.2", "roles": ["Security events", "Flows"]}]},
-        "getNetworkAlertsSettings": {"defaultDestinations": {"allAdmins": True},
+        "getNetworkAlertsSettings": {"defaultDestinations": {"allAdmins": True, "httpServerIds": ["h1"]},
                                      "alerts": [{"type": "settingsChanged", "enabled": True}]},
+        "getNetworkWebhooksHttpServers": [
+            {"id": "h1", "name": "siem", "enabled": True, "url": "https://siem.acme.com/meraki",
+             "payloadTemplate": {"payloadTemplateId": "wpt_00001", "name": "Meraki (included)"}}],
+        "getNetworkWebhooksPayloadTemplates": [
+            {"payloadTemplateId": "wpt_00001", "type": "included", "name": "Meraki (included)"}],
+        "getOrganizationWebhooksLogs": [{"networkId": "N1", "url": "https://siem.acme.com/meraki",
+                                         "responseCode": 200}],
         "getNetworkFirmwareUpgrades": {"products": {"appliance": {
             "currentVersion": {"shortName": "MX 19.1", "releaseType": "stable", "releaseDate": today},
             "availableVersions": []}}},
@@ -220,6 +238,7 @@ def test_insecure_org_flags_expected_issues(capsys):
         "MX-IPS-01", "MX-AMP-01", "MX-CF-01",
         "WL-SSID-01", "WL-SSID-02", "WL-SSID-04", "WL-SSID-05", "WL-SSID-06", "WL-SSID-07",
         "WL-SSID-08", "WL-SSID-10", "WL-BT-01", "WL-BT-02", "WL-USB-01",
+        "NET-HOOK-01", "NET-HOOK-02", "NET-HOOK-04", "ORG-HOOK-01",
         "SW-STP-01", "SW-DHCP-01", "SW-DHCP-02", "SW-NAC-01", "SW-DAI-01",
     }
     assert expected - ids == set(), f"missing: {sorted(expected - ids)}"
@@ -232,7 +251,7 @@ def test_insecure_org_flags_expected_issues(capsys):
 def test_secrets_never_in_report(capsys):
     _, out, _ = run(insecure(), capsys=capsys)
     blob = json.dumps(out)
-    for secret in ("corp1234", "public", '"short"'):
+    for secret in ("corp1234", "public", '"short"', "TOKEN123", "key=abc"):
         assert secret not in blob
 
 
@@ -587,3 +606,63 @@ def test_markdown_grouped(capsys):
     md = capsys.readouterr().out
     row = next(l for l in md.splitlines() if "| WL-SSID-02 |" in l)
     assert "(2)" in row and "Acme / HQ - Guest<br>Acme / Lab - Guest" in row
+
+
+def test_webhooks(capsys):
+    data = insecure()
+    _, out, _ = run(data, "--trusted-webhook-domain", "acme.com", capsys=capsys)
+    hooks = {f["check_id"]: f for f in out["findings"] if "HOOK" in f["check_id"]}
+    assert hooks["NET-HOOK-01"]["severity"] == "HIGH"
+    assert hooks["NET-HOOK-03"]["resource"] == "ticketing"
+    assert "http://hooks.vendor.io" in hooks["NET-HOOK-01"]["detail"]
+    log = hooks["ORG-HOOK-01"]
+    assert log["severity"] == "MEDIUM" and "2 of 2" in log["detail"]
+    assert "500" in log["detail"] and "no response" in log["detail"]
+
+
+def test_webhooks_trust_and_ips(capsys):
+    data = hardened()
+    data["getNetworkWebhooksHttpServers"] = [
+        {"id": "h1", "name": "siem", "url": "https://siem.acme.com/x",
+         "payloadTemplate": {"payloadTemplateId": "wpt_00001"}},
+        {"id": "h2", "name": "internal", "url": "http://10.1.1.9:8080/x",
+         "payloadTemplate": {"payloadTemplateId": "wpt_00001"}},
+        {"id": "h3", "name": "spoof", "url": "https://acme.com.evil.io/x",
+         "payloadTemplate": {"payloadTemplateId": "wpt_00001"}},
+        {"id": "h4", "name": "off", "enabled": False, "url": "http://8.8.8.8/x"}]
+    data["getNetworkAlertsSettings"] = {"defaultDestinations": {"allAdmins": True,
+                                                                "httpServerIds": ["h1", "h2", "h3"]},
+                                        "alerts": []}
+    data["getOrganizationWebhooksLogs"] = [
+        {"networkId": "N1", "url": "https://siem.acme.com/x", "responseCode": 200},
+        {"networkId": "N1", "url": "https://siem.acme.com/x", "responseCode": 404}]
+    _, out, ids = run(data, "--trusted-webhook-domain", "acme.com", capsys=capsys)
+    by = {(f["check_id"], f["resource"]): f for f in out["findings"]}
+    assert by[("NET-HOOK-01", "internal")]["severity"] == "MEDIUM"   # private IP over HTTP
+    assert ("NET-HOOK-03", "spoof") in by                              # suffix, not substring
+    assert ("NET-HOOK-03", "siem") not in by and ("NET-HOOK-03", "internal") not in by
+    assert not any(f["resource"] == "off" for f in out["findings"])   # disabled receiver ignored
+    assert by[("ORG-HOOK-01", "https://siem.acme.com [HQ]")]["severity"] == "LOW"
+    assert ids == {"NET-HOOK-01", "NET-HOOK-03", "ORG-HOOK-01"}
+
+
+def test_webhook_template_with_secret_header_is_ok(capsys):
+    data = hardened()
+    data["getNetworkWebhooksHttpServers"][0]["payloadTemplate"] = {"payloadTemplateId": "wpt_1"}
+    data["getNetworkWebhooksPayloadTemplates"] = [
+        {"payloadTemplateId": "wpt_1", "type": "custom", "name": "c",
+         "headers": [{"name": "Authorization", "template": "Bearer {{sharedSecret}}"}], "body": "{}"}]
+    _, _, ids = run(data, capsys=capsys)
+    assert ids == set()
+    data["getNetworkWebhooksPayloadTemplates"][0]["headers"] = []
+    _, _, ids = run(data, capsys=capsys)
+    assert ids == {"NET-HOOK-02"}
+
+
+def test_webhook_public_ip_info(capsys):
+    data = hardened()
+    data["getNetworkWebhooksHttpServers"][0]["url"] = "https://8.8.8.8/x"
+    _, _, ids = run(data, capsys=capsys)
+    assert ids == {"NET-HOOK-05"}
+    assert ma.webhook_host("https://u:p@[2001:db8::1]:8443/t?k=v") == (
+        "https", "2001:db8::1", "https://[2001:db8::1]:8443")

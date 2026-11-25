@@ -20,6 +20,7 @@ python meraki_audit.py --org-id 123456 --format markdown -o report.md
 python meraki_audit.py --format json -o findings.json --fail-on HIGH     # CI gate (exit 2)
 python meraki_audit.py --network-tag prod --min-severity MEDIUM
 python meraki_audit.py --trusted-domain example.com --inactive-days 60 -v
+python meraki_audit.py --trusted-webhook-domain example.com --trusted-webhook-domain splunkcloud.com
 ```
 
 Output formats: `text`, `markdown`, `json`, `csv`. Run `--help` to see every option and threshold.
@@ -35,7 +36,8 @@ Checks that fail with 400/403/404 (feature not licensed, not applicable, or no p
 listed as *skipped* instead of crashing the run. Add `-v` to see them.
 
 **Secrets:** Wi‑Fi PSKs, SNMP communities and VPN pre-shared keys are checked locally for strength
-but never written to the report. Change-log entries are reported by page and setting name
+but never written to the report. Webhook URLs are reported as scheme, host and port only;
+their path, query and user info (which often hold tokens) are never written. Change-log entries are reported by page and setting name
 only; their old and new values (which can contain PSKs) are never written. The report still
 includes admin names/emails, source IPs of API callers and network
 details, so treat it as sensitive.
@@ -79,6 +81,7 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
 | **Switching** | uplink trunk missing VLANs used by the switch's access ports, RSTP disabled, rogue DHCP not blocked / no alert, Dynamic ARP Inspection off, access ports set to Trusted DAI, DAI-enabled switch without a trusted uplink, switch models that cannot enforce DAI, no 802.1X policies, 802.1X Multi-Host mode, fewer than two RADIUS servers, RADIUS (auth or accounting) servers without RadSec, RADIUS accounting off, fail-open critical-auth VLAN, trunks allowing all VLANs, native VLAN 1, access ports in VLAN 1, no BPDU guard |
 | **Management plane** | local status page without auth, remote status page access |
 | **Logging & monitoring** | no syslog server, security events not sent to syslog, no alert recipients, security alerts disabled |
+| **Webhooks** | receivers over plain HTTP (private IP → MEDIUM), custom payload templates that do not send `{{sharedSecret}}`, receivers outside `--trusted-webhook-domain`, receivers addressed by a public IP, receivers no network alert uses, failed deliveries in the org webhook log (look-back `--log-days`, max 30; all failed → MEDIUM) |
 | **Firmware** | beta firmware, newer stable available, firmware older than `--firmware-max-age-days` |
 
 ### Known limits of the inferred checks
@@ -105,6 +108,12 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
   (`radsecEnabled`) and the switch access policy (`radsec.enabled`). Servers whose API
   response has no RadSec field are not reported, since their state is unknown. The finding is
   MEDIUM only when a server is a public IP address; hostnames are not resolved.
+- **Webhook shared secret (`NET-HOOK-02`)**: the API never returns the shared secret, so the
+  check cannot see whether one is set. It flags custom payload templates that do not reference
+  `{{sharedSecret}}` in the body or headers (the receiver then has nothing to verify).
+  Built-in templates are not flagged. `NET-HOOK-04` only looks at network alert settings;
+  sensor and camera alert profiles can also use a receiver. `--trusted-webhook-domain`
+  matches the domain and its subdomains; private IPs always count as trusted.
 - **Trusted DAI (`SW-DAI-03/04`)**: `daiTrusted` is only in the per-switch port list, so
   the tool makes one extra API call per switch, and only in networks where DAI is enabled.
   An uplink is a trunk port, or a port tagged or named `uplink`.
