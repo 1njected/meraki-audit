@@ -24,6 +24,13 @@ python meraki_audit.py --trusted-domain example.com --inactive-days 60 -v
 
 Output formats: `text`, `markdown`, `json`, `csv`. Run `--help` to see every option and threshold.
 
+**Grouping:** in `text` and `markdown`, the same issue found in several places (same check,
+severity, title and fix) is shown once, with the explanation and fix followed by the list of
+affected networks/devices/SSIDs/admins and what is specific to each. Use `--no-group` for one
+entry per finding. `json` and `csv` always have one row per finding. `resource` names the
+affected object, `item` holds the part of `detail` specific to it, and `detail` has the full
+text. Severity counts, `--min-severity` and `--fail-on` always count individual findings.
+
 Checks that fail with 400/403/404 (feature not licensed, not applicable, or no permission) are
 listed as *skipped* instead of crashing the run. Add `-v` to see them.
 
@@ -58,17 +65,18 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
 
 | Area | Checks |
 |---|---|
-| **Org login security** | 2FA enforced, strong passwords, account lockout, idle timeout, password reuse, login IP ranges, API key IP restrictions |
-| **Admins** | admins without 2FA, inactive accounts, too many / only one full admin, pending/locked accounts, full admins with API keys, admins outside `--trusted-domain` |
+| **Org login security** | 2FA enforced, minimum password length (`--min-password-length`, HIGH without 2FA), password reuse and history length (`--password-history`), periodic password expiry (INFO), account lockout, idle timeout, login IP ranges, API key IP restrictions |
+| **Admins** | admins without 2FA, inactive accounts, too many / only one full admin, pending/locked accounts, full admins with API keys, admins outside `--trusted-domain`, many local admins although SAML SSO is on |
 | **API usage** | API keys unused in the last `--log-days` (max 31), configuration changed through the API (by admin, with source IPs and user agents), deprecated API v0 still in use |
 | **Change log** | security settings turned off, changes by accounts that are not current org admins, changes by admins outside `--trusted-domain`, summary of recent security-relevant changes by area (look-back `--log-days`, max 365) |
+| **Meraki Support access** | Support access unblocked (latest change to *Block Meraki Support* in the change log), configuration changes made by Meraki Support (look-back `--log-days`) |
 | **SSO** | SAML enabled, IdP configured, SAML roles with full access |
 | **SNMP** | Dashboard SNMP v2c, MD5/DES on v3, no peer IP restriction; device SNMP community mode |
 | **VPN** | 3rd-party peers: IKEv1, default (weak) IPsec preset, DES/3DES/MD5/SHA1/DH 1/2/5, short PSK, scoping; site-to-site VPN firewall rules, including rules hidden by an earlier rule |
 | **MX firewall** | any/any allow rules, rules that never match because an earlier rule covers them (conflicting → MEDIUM, redundant → INFO), no deny rules, undocumented rules, no syslog on rules, inbound rules from any source, port forwards / 1:1 / 1:many NAT open to the internet (sensitive ports → HIGH), WAN web/SNMP services unrestricted, passthrough mode, IP spoofing protection not set to block |
 | **MX threat protection** | IDS/IPS disabled or detection-only, weak ruleset, AMP disabled, no blocked URL categories |
-| **Wireless** | WEP, open SSIDs, WPA1/TKIP, weak PSKs, shared PSK on bridged SSIDs, guest SSIDs bridged into LAN, no client isolation, guest LAN access allowed, 802.1X without RADIUS, Air Marshal default policy, AP Bluetooth scanning / BLE beacon advertising on, AP USB ports enabled in port profiles |
-| **Switching** | uplink trunk missing VLANs used by the switch's access ports, RSTP disabled, rogue DHCP not blocked / no alert, no 802.1X policies, 802.1X Multi-Host mode, fewer than two RADIUS servers, RADIUS accounting off, fail-open critical-auth VLAN, trunks allowing all VLANs, native VLAN 1, access ports in VLAN 1, no BPDU guard |
+| **Wireless** | WEP, open SSIDs, WPA1/TKIP, weak PSKs, shared PSK on bridged SSIDs, guest SSIDs bridged into LAN, no client isolation, guest LAN access allowed, 802.1X without RADIUS, RADIUS servers without RadSec (public RADIUS host → MEDIUM), Air Marshal default policy, AP Bluetooth scanning / BLE beacon advertising on, AP USB ports enabled in port profiles |
+| **Switching** | uplink trunk missing VLANs used by the switch's access ports, RSTP disabled, rogue DHCP not blocked / no alert, Dynamic ARP Inspection off, access ports set to Trusted DAI, DAI-enabled switch without a trusted uplink, switch models that cannot enforce DAI, no 802.1X policies, 802.1X Multi-Host mode, fewer than two RADIUS servers, RADIUS (auth or accounting) servers without RadSec, RADIUS accounting off, fail-open critical-auth VLAN, trunks allowing all VLANs, native VLAN 1, access ports in VLAN 1, no BPDU guard |
 | **Management plane** | local status page without auth, remote status page access |
 | **Logging & monitoring** | no syslog server, security events not sent to syslog, no alert recipients, security alerts disabled |
 | **Firmware** | beta firmware, newer stable available, firmware older than `--firmware-max-age-days` |
@@ -88,6 +96,18 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
   models with configurable ports. Networks without such APs are skipped (shown with `-v`), so
   no finding there does not prove a USB port is disabled. Bluetooth (`WL-BT-01/02`) is a
   network-wide setting and covers every AP in the network.
+- **Meraki Support access (`ORG-SUP-01/02`)**: the Dashboard API does not expose the
+  *Block Meraki Support* setting, so it is inferred from the change log. If the setting was
+  not changed within `--log-days`, its current state is unknown and the check is listed as
+  skipped (shown with `-v`); verify it in Organization > Settings. Support changes are
+  matched by an admin name containing "Meraki Support" or an `@meraki.com` email.
+- **RadSec (`WL-RADSEC-01`, `SW-RADSEC-01`)**: read per RADIUS server from the SSID
+  (`radsecEnabled`) and the switch access policy (`radsec.enabled`). Servers whose API
+  response has no RadSec field are not reported, since their state is unknown. The finding is
+  MEDIUM only when a server is a public IP address; hostnames are not resolved.
+- **Trusted DAI (`SW-DAI-03/04`)**: `daiTrusted` is only in the per-switch port list, so
+  the tool makes one extra API call per switch, and only in networks where DAI is enabled.
+  An uplink is a trunk port, or a port tagged or named `uplink`.
 
 Severities are `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`. Each finding has a stable `check_id`
 (e.g. `MX-NAT-01`) so you can track or suppress it in downstream tooling.
@@ -107,7 +127,8 @@ or network access is needed.
 - Rate limits: the Dashboard API allows about 10 requests/s per org. The SDK backs off on 429
   responses automatically. `--workers` (default 4) controls how many networks are audited in parallel.
 - Networks bound to configuration templates report the effective (template) settings.
-- Thresholds such as PSK length, idle timeout and admin inactivity are opinions. Adjust them
+- Thresholds such as PSK and password length, password history, idle timeout and admin
+  inactivity are opinions. Adjust them
   through the CLI options to match your policy.
 
 ## License

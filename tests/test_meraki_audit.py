@@ -26,7 +26,8 @@ def insecure() -> dict:
     old = int(time.time()) - 200 * 86400
     return {
         "getOrganizations": [ORG],
-        "getOrganizationLoginSecurity": {"enforceTwoFactorAuth": False, "enforceStrongPasswords": False,
+        "getOrganizationLoginSecurity": {"enforceTwoFactorAuth": False, "minimumPasswordLength": 8,
+                                         "enforcePasswordExpiration": True, "passwordExpirationDays": 30,
                                          "enforceAccountLockout": False, "enforceIdleTimeout": False,
                                          "enforceDifferentPasswords": False, "enforceLoginIpRanges": False,
                                          "apiAuthentication": {"ipRestrictionsForKeys": {"enabled": False}}},
@@ -91,7 +92,8 @@ def insecure() -> dict:
             {"profileId": "2", "name": "Locked", "isDefault": False, "ports": [],
              "usbPorts": [{"name": "usb port", "enabled": False}]}],
         "getNetworkSwitchStp": {"rstpEnabled": False},
-        "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "allow", "alerts": {"email": {"enabled": False}}},
+        "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "allow", "alerts": {"email": {"enabled": False}},
+                                             "arpInspection": {"enabled": False}},
         "getNetworkSwitchAccessPolicies": [],
     }
 
@@ -101,7 +103,8 @@ def hardened() -> dict:
     today = time.strftime("%Y-%m-%dT00:00:00Z")
     return {
         "getOrganizations": [ORG],
-        "getOrganizationLoginSecurity": {"enforceTwoFactorAuth": True, "enforceStrongPasswords": True,
+        "getOrganizationLoginSecurity": {"enforceTwoFactorAuth": True, "minimumPasswordLength": 14,
+                                         "numDifferentPasswords": 5, "enforcePasswordExpiration": False,
                                          "enforceAccountLockout": True, "accountLockoutAttempts": 5,
                                          "enforceIdleTimeout": True, "idleTimeoutMinutes": 15,
                                          "enforceDifferentPasswords": True, "enforceLoginIpRanges": True,
@@ -153,7 +156,7 @@ def hardened() -> dict:
         "getNetworkWirelessSsids": [
             {"number": 0, "name": "Corp", "enabled": True, "authMode": "8021x-radius",
              "encryptionMode": "wpa-eap", "wpaEncryptionMode": "WPA3 Transition Mode",
-             "radiusServers": [{"host": "10.1.1.3"}], "ipAssignmentMode": "Bridge mode"},
+             "radiusServers": [{"host": "10.1.1.3", "radsecEnabled": True}], "ipAssignmentMode": "Bridge mode"},
             {"number": 1, "name": "Guest", "enabled": True, "authMode": "psk", "encryptionMode": "wpa",
              "wpaEncryptionMode": "WPA2 only", "psk": "Tr0ub4dor&3-Horse-Staple!", "ipAssignmentMode": "NAT mode"},
         ],
@@ -163,10 +166,17 @@ def hardened() -> dict:
             {"profileId": "1", "name": "Default", "isDefault": True, "ports": [],
              "usbPorts": [{"name": "usb port", "enabled": False}]}],
         "getNetworkSwitchStp": {"rstpEnabled": True},
-        "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "block", "alerts": {"email": {"enabled": True}}},
+        "getNetworkSwitchDhcpServerPolicy": {"defaultPolicy": "block", "alerts": {"email": {"enabled": True}},
+                                             "arpInspection": {"enabled": True, "unsupportedModels": []}},
+        "getNetworkDevices": [{"serial": "Q1", "name": "sw1", "model": "MS250-48", "productType": "switch"},
+                              {"serial": "Q2", "name": "ap1", "model": "MR46", "productType": "wireless"}],
+        "getDeviceSwitchPorts": [
+            {"portId": "1", "enabled": True, "type": "trunk", "daiTrusted": True},
+            {"portId": "2", "enabled": True, "type": "access", "daiTrusted": False}],
         "getNetworkSwitchAccessPolicies": [{
             "name": "dot1x", "accessPolicyType": "802.1x", "hostMode": "Multi-Domain",
-            "radiusServers": [{"host": "10.1.1.3"}, {"host": "10.2.1.3"}],
+            "radiusServers": [{"host": "10.1.1.3", "radsec": {"enabled": True}},
+                              {"host": "10.2.1.3", "radsec": {"enabled": True}}],
             "radiusAccountingEnabled": True,
             "radius": {"criticalAuth": {"dataVlanId": None}, "failedAuthVlanId": None}}],
     }
@@ -200,7 +210,7 @@ def test_insecure_org_flags_expected_issues(capsys):
     rc, out, ids = run(insecure(), "--trusted-domain", "acme.com", "--fail-on", "HIGH", capsys=capsys)
     assert rc == 2
     expected = {
-        "ORG-LS-01", "ORG-LS-02", "ORG-LS-03", "ORG-LS-05", "ORG-LS-09", "ORG-SSO-01",
+        "ORG-LS-01", "ORG-LS-02", "ORG-LS-03", "ORG-LS-05", "ORG-LS-09", "ORG-LS-11", "ORG-SSO-01",
         "ORG-ADM-03", "ORG-ADM-04", "ORG-ADM-05", "ORG-ADM-06", "ORG-ADM-07",
         "ORG-SNMP-01", "ORG-SNMP-02", "ORG-SNMP-03", "ORG-SNMP-04",
         "ORG-VPN-01", "ORG-VPN-02", "ORG-VPN-04", "ORG-VPN-06", "WL-AM-01",
@@ -210,7 +220,7 @@ def test_insecure_org_flags_expected_issues(capsys):
         "MX-IPS-01", "MX-AMP-01", "MX-CF-01",
         "WL-SSID-01", "WL-SSID-02", "WL-SSID-04", "WL-SSID-05", "WL-SSID-06", "WL-SSID-07",
         "WL-SSID-08", "WL-SSID-10", "WL-BT-01", "WL-BT-02", "WL-USB-01",
-        "SW-STP-01", "SW-DHCP-01", "SW-DHCP-02", "SW-NAC-01",
+        "SW-STP-01", "SW-DHCP-01", "SW-DHCP-02", "SW-NAC-01", "SW-DAI-01",
     }
     assert expected - ids == set(), f"missing: {sorted(expected - ids)}"
     # disabled SSIDs are ignored
@@ -370,7 +380,7 @@ def test_api_usage(capsys):
         if kw.get("method") == "POST":
             return [{"adminId": "B1", "method": "POST", "sourceIp": "198.51.100.7", "userAgent": "terraform"}] * 3
         if kw.get("method") == "PUT":
-            return [{"adminId": "X9", "method": "PUT", "sourceIp": "203.0.113.9", "userAgent": "curl"}]
+            return [{"adminId": "X9", "method": "PUT", "sourceIp": "93.184.216.34", "userAgent": "curl"}]
         if kw.get("version") == 0:
             return [{"adminId": "B1", "userAgent": "legacy-script"}]
         return []
@@ -437,3 +447,143 @@ def test_ap_usb_reports_only_enabled_profiles(capsys):
     usb = [f for f in out["findings"] if f["check_id"] == "WL-USB-01"]
     assert [f["resource"] for f in usb] == ["Default"]
     assert "default profile" in usb[0]["detail"]
+
+
+def support_changes(new_value="false"):
+    return [
+        {"ts": "2026-11-01T10:00:00Z", "adminId": "A1", "adminEmail": "a@acme.com",
+         "page": "Organization settings", "label": "Block Meraki Support",
+         "oldValue": "false", "newValue": "true"},
+        {"ts": "2026-11-10T10:00:00Z", "adminId": "A1", "adminEmail": "a@acme.com",
+         "page": "Organization settings", "label": "Block Meraki Support",
+         "oldValue": "true", "newValue": new_value},
+        {"ts": "2026-11-11T10:00:00Z", "adminName": "Meraki Support", "adminEmail": "",
+         "page": "Firewall", "label": "L3 firewall rules", "networkId": "N1", "networkName": "HQ",
+         "oldValue": "[]", "newValue": "[...]"},
+    ]
+
+
+def test_support_access_unblocked_and_support_changes(capsys):
+    data = with_admin_ids(hardened())
+    data["getOrganizationConfigurationChanges"] = support_changes("false")
+    _, out, ids = run(data, capsys=capsys)
+    assert {"ORG-SUP-01", "ORG-SUP-02"} <= ids
+    sup = next(f for f in out["findings"] if f["check_id"] == "ORG-SUP-01")
+    assert sup["severity"] == "MEDIUM" and "2026-11-10" in sup["detail"]
+    assert not any(s["check"] == "support-access" for s in out.get("skipped", []))
+
+
+def test_support_access_blocked_is_quiet(capsys):
+    data = with_admin_ids(hardened())
+    data["getOrganizationConfigurationChanges"] = support_changes("true")[:2]
+    _, out, ids = run(data, capsys=capsys)
+    assert not {"ORG-SUP-01", "ORG-SUP-02"} & ids
+    assert not any(s["check"] == "support-access" for s in out.get("skipped", []))
+
+
+def test_support_access_unknown_is_skipped(capsys):
+    _, out, ids = run(hardened(), capsys=capsys)
+    assert "ORG-SUP-01" not in ids
+    assert any(s["check"] == "support-access" for s in out["skipped"])
+
+
+def test_radsec(capsys):
+    data = hardened()
+    data["getNetworkWirelessSsids"][0]["radiusServers"] = [
+        {"host": "10.1.1.3", "radsecEnabled": False}, {"host": "93.184.216.34", "radsecEnabled": False},
+        {"host": "10.9.9.9"}]  # no field: unknown, not reported
+    pol = data["getNetworkSwitchAccessPolicies"][0]
+    pol["radiusServers"][1]["radsec"] = {"enabled": False}
+    pol["radiusAccountingServers"] = [{"host": "10.2.1.3", "radsec": {"enabled": False}}]
+    _, out, ids = run(data, capsys=capsys)
+    f = {x["check_id"]: x for x in out["findings"] if "RADSEC" in x["check_id"]}
+    assert set(f) == {"WL-RADSEC-01", "SW-RADSEC-01"}
+    assert f["WL-RADSEC-01"]["severity"] == "MEDIUM"  # public RADIUS server
+    assert "93.184.216.34" in f["WL-RADSEC-01"]["detail"] and "10.9.9.9" not in f["WL-RADSEC-01"]["detail"]
+    assert f["SW-RADSEC-01"]["severity"] == "LOW"
+    assert f["SW-RADSEC-01"]["detail"].count("10.2.1.3") == 1
+
+
+def test_dai_trusted_ports(capsys):
+    data = hardened()
+    data["getNetworkSwitchDhcpServerPolicy"]["arpInspection"]["unsupportedModels"] = ["MS120-8"]
+    calls = []
+    data["getDeviceSwitchPorts"] = lambda serial: calls.append(serial) or [
+        {"portId": "1", "enabled": True, "type": "trunk", "daiTrusted": False},
+        {"portId": "5", "enabled": True, "type": "access", "daiTrusted": True},
+        {"portId": "6", "enabled": False, "type": "access", "daiTrusted": True}]
+    _, out, ids = run(data, capsys=capsys)
+    f = {x["check_id"]: x for x in out["findings"] if x["check_id"].startswith("SW-DAI")}
+    assert set(f) == {"SW-DAI-02", "SW-DAI-03", "SW-DAI-04"}
+    assert f["SW-DAI-03"]["item"] == "1 access port(s): 5."  # disabled port 6 ignored
+    assert calls == ["Q1"]  # only switches are queried
+
+
+def test_dai_disabled_skips_port_calls(capsys):
+    data = hardened()
+    data["getNetworkSwitchDhcpServerPolicy"]["arpInspection"] = {"enabled": False}
+    data["getDeviceSwitchPorts"] = lambda serial: pytest.fail("ports fetched with DAI off")
+    _, out, ids = run(data, capsys=capsys)
+    assert {i for i in ids if i.startswith("SW-DAI")} == {"SW-DAI-01"}
+
+
+def test_password_policy(capsys):
+    data = hardened()
+    data["getOrganizationLoginSecurity"].update(minimumPasswordLength=10, numDifferentPasswords=2)
+    _, out, ids = run(data, capsys=capsys)
+    f = {x["check_id"]: x for x in out["findings"]}
+    assert f["ORG-LS-02"]["severity"] == "MEDIUM"  # 2FA enforced in the hardened fixture
+    assert "ORG-LS-10" in ids and "ORG-LS-11" not in ids
+    _, out, ids = run(data, "--min-password-length", "10", "--password-history", "2", capsys=capsys)
+    assert not {"ORG-LS-02", "ORG-LS-10"} & ids
+
+
+def test_password_length_without_mfa_is_high(capsys):
+    _, out, _ = run(insecure(), capsys=capsys)
+    f = next(x for x in out["findings"] if x["check_id"] == "ORG-LS-02")
+    assert f["severity"] == "HIGH" and "only 8 characters" in f["detail"]
+
+
+def run_text(data, *args, capsys=None):
+    ma.main(["-q", *args], dashboard=FakeDashboard(data))
+    return capsys.readouterr().out
+
+
+def test_grouped_text_lists_affected_once(capsys):
+    data = insecure()  # N1 and N2 both have the same open SSIDs
+    out = run_text(data, capsys=capsys)
+    block = out.split("WL-SSID-02  Open SSID without any access control")[1].split("\n\n")[0]
+    assert "(2 affected)" in block
+    assert "Detail: Open with no splash page" in block
+    assert "Acme / HQ - Guest" in block and "Acme / Lab - Guest" in block
+    assert out.count("WL-SSID-02") == 1
+    assert "distinct issues" in out
+
+
+def test_grouping_keeps_item_specific_text(capsys):
+    data = insecure()
+    data["getOrganizationNetworks"] = [NET, {**NET2, "productTypes": ["wireless", "switch"]}]
+    data["getOrganizationSwitchPortsBySwitch"].append(
+        {"name": "sw2", "serial": "Q2", "network": {"id": "N2", "name": "Lab"},
+         "ports": [{"portId": str(i), "enabled": True, "type": "access", "vlan": 1,
+                    "stpGuard": "disabled"} for i in (7, 8)]})
+    out = run_text(data, capsys=capsys)
+    block = out.split("SW-PORT-04  Access ports without BPDU guard")[1].split("\n\n")[0]
+    assert "Detail: A switch plugged into these ports" in block
+    assert "Acme / HQ - sw1 - 1 access port(s): 2." in block
+    assert "Acme / Lab - sw2 - 2 access port(s): 7, 8." in block
+
+
+def test_no_group_and_json_unchanged(capsys):
+    out = run_text(insecure(), "--no-group", capsys=capsys)
+    assert out.count("WL-SSID-02") == 2 and "affected" not in out
+    _, js, _ = run(insecure(), capsys=capsys)
+    ssid = [f for f in js["findings"] if f["check_id"] == "WL-SSID-02"]
+    assert len(ssid) == 2 and "why" not in ssid[0]
+
+
+def test_markdown_grouped(capsys):
+    ma.main(["-q", "--format", "markdown"], dashboard=FakeDashboard(insecure()))
+    md = capsys.readouterr().out
+    row = next(l for l in md.splitlines() if "| WL-SSID-02 |" in l)
+    assert "(2)" in row and "Acme / HQ - Guest<br>Acme / Lab - Guest" in row

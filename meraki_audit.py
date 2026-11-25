@@ -83,6 +83,18 @@ class Finding:
     network_id: str = ""
     network_name: str = ""
     resource: str = ""
+    item: str = ""  # the part of `detail` specific to this resource
+    # The general explanation (detail minus item). Used to print it once per group;
+    # not exported because `detail` already contains it.
+    why: str = field(default="", repr=False, metadata={"export": False})
+
+
+def finding_dict(f: Finding) -> dict:
+    return {k: v for k, v in asdict(f).items()
+            if Finding.__dataclass_fields__[k].metadata.get("export", True)}
+
+
+EXPORT_FIELDS = [k for k, v in Finding.__dataclass_fields__.items() if v.metadata.get("export", True)]
 
 
 @dataclass
@@ -99,6 +111,8 @@ class AuditConfig:
     min_psk_length: int = 12
     idle_timeout_max: int = 30
     lockout_attempts_max: int = 10
+    min_password_length: int = 12
+    password_history_min: int = 4
     firmware_max_age_days: int = 365
     log_days: int = 30
     trusted_domains: list[str] = field(default_factory=list)
@@ -139,13 +153,16 @@ class Scope:
         return str(self.org.get("name"))
 
     def add(self, severity: str, check_id: str, category: str, title: str,
-            detail: str, recommendation: str, resource: str = "") -> None:
+            detail: str, recommendation: str, resource: str = "", item: str = "") -> None:
+        """`item` is what is specific to this resource (names, counts, ports); `detail`
+        is then the general explanation. The exported detail is both joined."""
+        full = f"{item} {detail}".strip() if item else detail
         self.out.add(Finding(
             severity=severity, check_id=check_id, category=category,
-            title=title, detail=detail, recommendation=recommendation,
+            title=title, detail=full, recommendation=recommendation,
             org_id=str(self.org.get("id", "")), org_name=self.org.get("name", ""),
             network_id=self.net.get("id", ""), network_name=self.net.get("name", ""),
-            resource=resource,
+            resource=resource, item=item, why=detail if item else "",
         ))
 
     def call(self, check: str, fn: Callable, *args, **kwargs) -> Any:
@@ -445,10 +462,18 @@ def check_login_security(s: Scope) -> dict | None:
               "Dashboard admins can log in with only a password.",
               "Organization > Settings > Security: enable 'Force users to set up and use two-factor "
               "authentication' (or enforce MFA through SAML SSO).")
-    if not ls.get("enforceStrongPasswords"):
-        s.add("MEDIUM", "ORG-LS-02", cat, "Strong passwords not enforced",
-              "Admins may set weak Dashboard passwords.",
-              "Enable 'Force users to choose strong passwords'.")
+    # enforceStrongPasswords is deprecated (false is ignored); the policy is minimumPasswordLength.
+    min_len = ls.get("minimumPasswordLength")
+    if min_len is None:
+        s.out.skip(Skipped(s.label, "password-length", "minimumPasswordLength not returned by the API"))
+    elif min_len < s.cfg.min_password_length:
+        mfa = ls.get("enforceTwoFactorAuth")
+        s.add("MEDIUM" if mfa else "HIGH", "ORG-LS-02", cat, "Minimum password length too short",
+              f"Admin passwords need only {min_len} characters (threshold "
+              f"{s.cfg.min_password_length}){'' if mfa else ', and 2FA is not enforced'}.",
+              f"Organization > Settings > Security: set the minimum password length to "
+              f">= {s.cfg.min_password_length} (NIST SP 800-63B: 15 when the password is the only "
+              "factor).")
     if not ls.get("enforceAccountLockout"):
         s.add("MEDIUM", "ORG-LS-03", cat, "Account lockout not enabled",
               "No lockout after repeated failed logins (brute-force exposure).",
@@ -468,7 +493,20 @@ def check_login_security(s: Scope) -> dict | None:
     if not ls.get("enforceDifferentPasswords"):
         s.add("LOW", "ORG-LS-07", cat, "Password reuse not prevented",
               "Admins can reuse previous passwords.",
-              "Enable 'Force users to choose a password different from the last N passwords'.")
+              f"Enable 'Force users to choose a password different from the last N passwords' "
+              f"with N >= {s.cfg.password_history_min}.")
+    elif (ls.get("numDifferentPasswords") or 0) < s.cfg.password_history_min:
+        s.add("LOW", "ORG-LS-10", cat, "Short password history",
+              f"New passwords only have to differ from the last "
+              f"{ls.get('numDifferentPasswords') or 0} password(s).",
+              f"Raise the password history to >= {s.cfg.password_history_min}.")
+    if ls.get("enforcePasswordExpiration"):
+        s.add("INFO", "ORG-LS-11", cat, "Periodic password expiration enforced",
+              f"Admins must change their password every {ls.get('passwordExpirationDays')} days. "
+              "NIST SP 800-63B advises against forced periodic changes: they push users toward "
+              "predictable passwords.",
+              "Prefer long passwords + 2FA and force a change only on suspected compromise, "
+              "unless a policy you must follow requires expiry.")
     if not ls.get("enforceLoginIpRanges"):
         s.add("LOW", "ORG-LS-08", cat, "Dashboard login not restricted by source IP",
               "Admins can log in to this organization from any IP address.",
@@ -532,38 +570,39 @@ def check_admins(s: Scope, login_sec: dict | None, saml_enabled: bool) -> list[d
             note = (" (2FA is enforced org-wide; the user will be forced to enroll at next login)"
                     if mfa_enforced else "")
             s.add(sev, "ORG-ADM-03", cat, "Admin without two-factor authentication",
-                  f"{who} (orgAccess={access}) has no 2FA enrolled{note}.",
-                  "Require 2FA for every admin account.", resource=a.get("email", ""))
+                  f"Admin has no 2FA enrolled{note}.",
+                  "Require 2FA for every admin account.", resource=a.get("email", ""),
+                  item=f"{who} (orgAccess={access}).")
 
         last = parse_time(a.get("lastActive"))
         age = days_since(last)
         if age is not None and age > s.cfg.inactive_days:
             s.add("MEDIUM", "ORG-ADM-04", cat, "Inactive admin account",
-                  f"{who} last active {age} days ago (threshold {s.cfg.inactive_days}).",
+                  f"Not active for more than {s.cfg.inactive_days} days.",
                   "Remove or disable admin accounts that are no longer used.",
-                  resource=a.get("email", ""))
+                  resource=a.get("email", ""), item=f"{who} last active {age} days ago.")
 
         status = lower(a.get("accountStatus"))
         if status and status != "ok":
             s.add("LOW", "ORG-ADM-05", cat, f"Admin account status '{status}'",
-                  f"{who} has account status '{status}'.",
+                  f"Account status is '{status}'.",
                   "Clean up locked, unverified or pending admin invitations.",
-                  resource=a.get("email", ""))
+                  resource=a.get("email", ""), item=f"{who}.")
 
         if a.get("hasApiKey") and access == "full":
             s.add("INFO", "ORG-ADM-06", cat, "Full admin has an API key",
-                  f"{who} has an API key with full org privileges.",
+                  "Has an API key with full org privileges.",
                   "Use dedicated read-only service accounts for automation; rotate keys regularly.",
-                  resource=a.get("email", ""))
+                  resource=a.get("email", ""), item=f"{who}.")
 
         if s.cfg.trusted_domains:
             domain = lower(a.get("email")).rsplit("@", 1)[-1]
             if domain not in s.cfg.trusted_domains:
                 sev = "MEDIUM" if access in ("full", "enterprise") else "LOW"
                 s.add(sev, "ORG-ADM-07", cat, "Admin from untrusted email domain",
-                      f"{who} (orgAccess={access}) is outside trusted domains.",
+                      "Email domain is outside the trusted domains.",
                       "Verify third-party/partner access is still required and properly scoped.",
-                      resource=a.get("email", ""))
+                      resource=a.get("email", ""), item=f"{who} (orgAccess={access}).")
 
     if saml_enabled and len(full_admins) > 2:
         s.add("INFO", "ORG-ADM-08", cat, "Local admins exist alongside SAML",
@@ -605,10 +644,10 @@ def check_third_party_vpn(s: Scope) -> None:
         preset = lower(p.get("ipsecPoliciesPreset"))
         if lower(p.get("ikeVersion")) in ("1", "ikev1"):
             s.add("MEDIUM", "ORG-VPN-01", cat, "Third-party VPN peer uses IKEv1",
-                  f"Peer '{name}' uses IKEv1.", "Migrate to IKEv2.", resource=name)
+                  "Uses IKEv1.", "Migrate to IKEv2.", resource=name)
         if preset == "default":
             s.add("HIGH", "ORG-VPN-02", cat, "Third-party VPN peer uses default IPsec policy",
-                  f"Peer '{name}' uses the 'Default' preset (3DES/SHA1/DH group 2, no PFS).",
+                  "Uses the 'Default' preset (3DES/SHA1/DH group 2, no PFS).",
                   "Use a custom policy: AES-256/GCM, SHA-256+, DH group 14+ (19/20 preferred), PFS on.",
                   resource=name)
         pol = p.get("ipsecPolicies") or {}
@@ -623,16 +662,18 @@ def check_third_party_vpn(s: Scope) -> None:
             weak.append("PFS disabled")
         if weak and preset != "default":
             s.add("HIGH", "ORG-VPN-03", cat, "Third-party VPN peer allows weak crypto",
-                  f"Peer '{name}': {', '.join(weak)}.",
-                  "Remove DES/3DES/MD5/SHA1 and DH groups 1/2/5; enable PFS.", resource=name)
+                  "Weak algorithms are allowed.",
+                  "Remove DES/3DES/MD5/SHA1 and DH groups 1/2/5; enable PFS.", resource=name,
+                  item=f"{', '.join(weak)}.")
         secret = p.get("secret")
         if isinstance(secret, str) and secret and len(secret) < 20:
             s.add("MEDIUM", "ORG-VPN-04", cat, "Third-party VPN pre-shared key is short",
-                  f"Peer '{name}' PSK is {len(secret)} characters.",
-                  "Use a random PSK of at least 20-32 characters, or certificates.", resource=name)
+                  "A short PSK can be brute-forced offline from a captured IKE exchange.",
+                  "Use a random PSK of at least 20-32 characters, or certificates.", resource=name,
+                  item=f"PSK is {len(secret)} characters.")
         if not p.get("networkTags") or "all" in [lower(t) for t in p.get("networkTags", [])]:
             s.add("INFO", "ORG-VPN-05", cat, "Third-party VPN peer available to all networks",
-                  f"Peer '{name}' is reachable from all MX networks.",
+                  "Reachable from all MX networks.",
                   "Scope peers with network tags to only the sites that need them.", resource=name)
 
 
@@ -689,10 +730,10 @@ def check_api_usage(s: Scope, admins: list[dict] | None) -> None:
         if reqs is not None and not reqs:
             full = lower(a.get("orgAccess")) == "full"
             s.add("MEDIUM" if full else "LOW", "ORG-API-01", cat, "API key not used recently",
-                  f"{_who(a)} (orgAccess={lower(a.get('orgAccess'))}) has an API key but made no "
-                  f"API requests to this org in the last {days} days.",
+                  f"Has an API key but made no API requests to this org in the last {days} days.",
                   "Revoke unused API keys (My profile > API access). An idle key with org access "
-                  "is only useful to whoever steals it.", resource=a.get("email", ""))
+                  "is only useful to whoever steals it.", resource=a.get("email", ""),
+                  item=f"{_who(a)} (orgAccess={lower(a.get('orgAccess'))}).")
 
     # 2) Write requests: who changes config through the API, and from where.
     writes: dict[str, list[dict]] = {}
@@ -745,14 +786,16 @@ DISABLED_VALUES = {"false", "disabled", "off", "none", "0", "\"false\"", "\"disa
 
 
 def check_config_changes(s: Scope, admins: list[dict] | None, saml_enabled: bool,
-                         network_names: dict[str, str] | None) -> None:
+                         network_names: dict[str, str] | None) -> list[dict] | None:
     """Review the org change log. Old/new values are never reported: they can
-    contain PSKs and other secrets."""
+    contain PSKs and other secrets. Returns the in-scope changes."""
     days = max(1, min(s.cfg.log_days, 365))
     changes = s.call("config-changes", s.d.organizations.getOrganizationConfigurationChanges,
                      s.org["id"], timespan=days * 86400, perPage=5000, total_pages=4)
+    if changes is None:
+        return None
     if not changes:
-        return
+        return []
     if network_names is not None:  # --network-id/--network-tag: keep org-wide + in-scope
         changes = [c for c in changes if not c.get("networkId") or c["networkId"] in network_names]
     cat = "Change Log"
@@ -821,6 +864,68 @@ def check_config_changes(s: Scope, admins: list[dict] | None, saml_enabled: bool
               f"{len({c.get('adminEmail') or c.get('adminName') for c in cs})} admin(s). "
               f"Most recent: {examples(cs)}.",
               "Review against approved change requests.", resource=a)
+    return changes
+
+
+SUPPORT_SETTING_RX = re.compile(r"meraki support|support access", re.I)
+SUPPORT_ADMIN_RX = re.compile(r"meraki support|@meraki\.com$", re.I)
+TRUE_VALUES = {"true", "enabled", "on", "1", "yes", "checked", "blocked"}
+FALSE_VALUES = {"false", "disabled", "off", "0", "no", "unchecked", "unblocked", "allowed"}
+
+
+def _support_blocked(c: dict) -> bool | None:
+    """Whether a change to the support-access setting left support blocked.
+    None if the value is not recognised."""
+    v = lower(c.get("newValue")).strip('"')
+    on = True if v in TRUE_VALUES else False if v in FALSE_VALUES else None
+    if on is None:
+        return None
+    label = lower(f"{c.get('page') or ''} {c.get('label') or ''}")
+    return on if "block" in label else not on
+
+
+def check_support_access(s: Scope, changes: list[dict] | None) -> None:
+    """Meraki Support access (Organization > Settings > 'Block Meraki Support').
+    The Dashboard API does not expose this setting, so it is inferred from the
+    change log; old/new values are used for the decision but never reported."""
+    cat = "Identity & Access"
+    days = max(1, min(s.cfg.log_days, 365))
+    manual = ("not exposed by the Dashboard API; verify Organization > Settings > "
+              "'Meraki Support Access' manually")
+    if changes is None:
+        s.out.skip(Skipped(s.label, "support-access", f"{manual} (change log unavailable)"))
+        return
+
+    toggles = sorted((c for c in changes if not c.get("networkId")
+                      and SUPPORT_SETTING_RX.search(f"{c.get('page') or ''} {c.get('label') or ''}")),
+                     key=lambda c: str(c.get("ts") or ""))
+    latest = toggles[-1] if toggles else None
+    blocked = _support_blocked(latest) if latest else None
+    if latest and blocked is False:
+        who = latest.get("adminEmail") or latest.get("adminName") or "?"
+        s.add("MEDIUM", "ORG-SUP-01", cat, "Meraki Support access unblocked",
+              f"{who} allowed Meraki Support to access the organization on "
+              f"{str(latest.get('ts') or '')[:10]} (last change to this setting in the "
+              f"last {days} days).",
+              "Organization > Settings > Meraki Support Access: tick 'Block Meraki Support' "
+              "again once the support case is closed.", resource=who)
+    elif blocked is None:
+        seen = " (a change was logged but its value was not recognised)" if latest else ""
+        s.out.skip(Skipped(s.label, "support-access", f"{manual}{seen}"))
+
+    by_support: dict[str, list[dict]] = {}
+    for c in changes:
+        who = c.get("adminEmail") or c.get("adminName") or ""
+        if (SUPPORT_ADMIN_RX.search(lower(c.get("adminEmail")))
+                or SUPPORT_ADMIN_RX.search(lower(c.get("adminName")))):
+            by_support.setdefault(who, []).append(c)
+    for who, cs in sorted(by_support.items()):
+        cs = sorted(cs, key=lambda c: str(c.get("ts") or ""), reverse=True)
+        recent = "; ".join(f"{str(c.get('ts') or '')[:10]} {c.get('page') or ''} / "
+                           f"{c.get('label') or ''}" for c in cs[:3])
+        s.add("LOW", "ORG-SUP-02", cat, "Configuration changed by Meraki Support",
+              f"{who} made {len(cs)} change(s) in the last {days} days. Recent: {recent}.",
+              "Match each change to an open support case you requested.", resource=who)
 
 
 def check_air_marshal(s: Scope, networks: dict[str, str]) -> None:
@@ -885,20 +990,24 @@ def check_switch_ports(s: Scope, networks: dict[str, str]) -> None:
 
         if trunk_all:
             f_scope.add("LOW", "SW-PORT-01", cat, "Trunk ports allow all VLANs",
-                        f"Switch {name}: {len(trunk_all)} trunk port(s) allow all VLANs ({short(trunk_all)}).",
-                        "Prune allowed VLANs on trunks to only what is required.", resource=name)
+                        "Trunks carry every VLAN, so a mis-patched or compromised neighbour reaches all of them.",
+                        "Prune allowed VLANs on trunks to only what is required.", resource=name,
+                        item=f"{len(trunk_all)} trunk port(s): {short(trunk_all)}.")
         if native1:
             f_scope.add("LOW", "SW-PORT-02", cat, "Trunk ports use native VLAN 1",
-                        f"Switch {name}: {len(native1)} trunk port(s) with native VLAN 1 ({short(native1)}).",
-                        "Use an unused, dedicated native VLAN to mitigate VLAN hopping.", resource=name)
+                        "Native VLAN 1 on trunks enables double-tagging VLAN hopping.",
+                        "Use an unused, dedicated native VLAN to mitigate VLAN hopping.", resource=name,
+                        item=f"{len(native1)} trunk port(s): {short(native1)}.")
         if access_vlan1:
             f_scope.add("LOW", "SW-PORT-03", cat, "Access ports in VLAN 1",
-                        f"Switch {name}: {len(access_vlan1)} enabled access port(s) in default VLAN 1 ({short(access_vlan1)}).",
-                        "Move access ports to purpose-specific VLANs; disable unused ports.", resource=name)
+                        "Enabled access ports are in the default VLAN 1.",
+                        "Move access ports to purpose-specific VLANs; disable unused ports.", resource=name,
+                        item=f"{len(access_vlan1)} access port(s): {short(access_vlan1)}.")
         if no_bpdu:
             f_scope.add("LOW", "SW-PORT-04", cat, "Access ports without BPDU guard",
-                        f"Switch {name}: {len(no_bpdu)} access port(s) without BPDU guard ({short(no_bpdu)}).",
-                        "Enable BPDU guard on edge/access ports.", resource=name)
+                        "A switch plugged into these ports can join or disrupt spanning tree.",
+                        "Enable BPDU guard on edge/access ports.", resource=name,
+                        item=f"{len(no_bpdu)} access port(s): {short(no_bpdu)}.")
         check_uplink_vlans(f_scope, name, trunks, in_use)
 
 
@@ -931,13 +1040,13 @@ def check_uplink_vlans(s: Scope, switch: str, trunks: list[dict],
                          for v, pids in sorted(missing.items()))
         s.add("HIGH", "SW-TRUNK-01", "Switching",
               "Uplink trunk does not carry VLANs used on this switch",
-              f"Switch {switch} uplink port {pid} allows VLANs '{up.get('allowedVlans')}' "
-              f"(native {up.get('vlan')}), but enabled access ports use "
-              f"{compact_vlans(missing)} ({used}). Devices on those ports get link and PoE "
-              "but cannot reach anything beyond this switch.",
-              f"Add {compact_vlans(missing)} to the allowed VLANs on {switch} port {pid} and on "
-              "the far end of the link. Ignore if this switch routes those VLANs itself "
-              "(MS layer-3 interface).", resource=f"{switch} port {pid}")
+              "Devices on those ports get link and PoE but cannot reach anything beyond "
+              "this switch.",
+              "Add the missing VLANs to the uplink's allowed VLANs and to the far end of the "
+              "link. Ignore if this switch routes those VLANs itself (MS layer-3 interface).",
+              resource=f"{switch} port {pid}",
+              item=f"Uplink allows VLANs '{up.get('allowedVlans')}' (native {up.get('vlan')}), "
+                   f"but enabled access ports use {compact_vlans(missing)} ({used}).")
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,8 +1137,9 @@ def check_firmware(s: Scope) -> None:
         rtype = lower(cur.get("releaseType"))
         if rtype == "beta":
             s.add("LOW", "FW-01", cat, f"{product} running beta firmware",
-                  f"{product} runs {cur_name} (beta).",
-                  "Run stable firmware in production unless a beta fix is needed.", resource=product)
+                  "Beta firmware is less tested.",
+                  "Run stable firmware in production unless a beta fix is needed.", resource=product,
+                  item=f"Runs {cur_name}.")
         cur_date = parse_time(cur.get("releaseDate"))
         newer_stable = [
             v for v in (info.get("availableVersions") or [])
@@ -1039,15 +1149,17 @@ def check_firmware(s: Scope) -> None:
         if newer_stable:
             latest = max(newer_stable, key=lambda v: parse_time(v.get("releaseDate")) or cur_date)
             s.add("MEDIUM", "FW-02", cat, f"{product} firmware not on latest stable",
-                  f"{product} runs {cur_name}; newer stable available: "
-                  f"{latest.get('shortName') or latest.get('firmware')}.",
+                  "A newer stable release is available.",
                   "Schedule an upgrade to the latest stable release (security fixes).",
-                  resource=product)
+                  resource=product,
+                  item=f"Runs {cur_name}; latest stable "
+                       f"{latest.get('shortName') or latest.get('firmware')}.")
         age = days_since(cur_date)
         if age is not None and age > s.cfg.firmware_max_age_days:
             s.add("MEDIUM", "FW-03", cat, f"{product} firmware is old",
-                  f"{product} runs {cur_name}, released {age} days ago.",
-                  "Upgrade to a current stable firmware.", resource=product)
+                  f"Firmware is older than {s.cfg.firmware_max_age_days} days.",
+                  "Upgrade to a current stable firmware.", resource=product,
+                  item=f"Runs {cur_name}, released {age} days ago.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1117,11 +1229,12 @@ def check_mx_port_forwarding(s: Scope) -> None:
         name = r.get("name") or f"{r.get('protocol')}/{r.get('publicPort')}"
         s.add("HIGH" if risky else "MEDIUM", "MX-NAT-01", "Firewall",
               "Port forward open to the internet",
-              f"Port forward '{name}' exposes {r.get('protocol')}/{r.get('publicPort')} -> "
-              f"{r.get('lanIp')}:{r.get('localPort')} to any source"
-              + (f" (sensitive: {', '.join(risky)})" if risky else "") + ".",
+              "Reachable from any internet source.",
               "Restrict 'Allowed remote IPs', or publish the service through VPN/ZTNA instead.",
-              resource=name)
+              resource=name,
+              item=f"{r.get('protocol')}/{r.get('publicPort')} -> "
+                   f"{r.get('lanIp')}:{r.get('localPort')}"
+                   + (f" (sensitive: {', '.join(risky)})" if risky else "") + ".")
 
 
 def check_mx_nat(s: Scope) -> None:
@@ -1229,6 +1342,30 @@ def check_mx_mode(s: Scope) -> None:
 # Wireless (MR) checks
 # --------------------------------------------------------------------------- #
 
+def _radius_without_radsec(servers: Iterable[dict], flag: Callable[[dict], Any]) -> list[str]:
+    """Hosts of RADIUS servers that report RadSec as off. Servers whose response has no
+    RadSec field (older API/firmware) are left out: their state is unknown."""
+    return [str(r.get("host") or "?") for r in servers or [] if flag(r) is False]
+
+
+def _radsec_finding(s: Scope, check_id: str, cat: str, what: str, hosts: list[str],
+                    fix: str, resource: str) -> None:
+    def public(h: str) -> bool:
+        try:
+            return ipaddress.ip_address(h).is_global
+        except ValueError:
+            return False  # hostname: can't tell where it is
+    pub = [h for h in hosts if public(h)]
+    sev = "MEDIUM" if pub else "LOW"
+    where = (f" {_short(pub)} is on the public internet, so RADIUS crosses it unencrypted."
+             if pub else "")
+    s.add(sev, check_id, cat, "RADIUS without RadSec (RADIUS over plain UDP)",
+          "Classic RADIUS hides only the password (MD5 with the shared secret); usernames, "
+          "MACs and other attributes travel in clear text, and the MD5 integrity check is "
+          "open to Blast-RADIUS (CVE-2024-3596) forgery on the path.",
+          fix, resource=resource, item=f"{what} sends RADIUS to {_short(hosts)} over UDP.{where}")
+
+
 def check_ssids(s: Scope) -> None:
     ssids = s.call("ssids", s.d.wireless.getNetworkWirelessSsids, s.net["id"])
     if not ssids:
@@ -1248,23 +1385,24 @@ def check_ssids(s: Scope) -> None:
 
         if enc == "wep":
             s.add("CRITICAL", "WL-SSID-01", cat, "SSID uses WEP",
-                  f"'{name}' uses WEP, which is trivially broken.",
+                  "WEP is trivially broken.",
                   "Use WPA3 (or WPA2/WPA3 transition) with 802.1X or a strong PSK.", resource=name)
         if auth == "open" and not has_splash:
             s.add("HIGH", "WL-SSID-02", cat, "Open SSID without any access control",
-                  f"'{name}' is open with no splash page; traffic is unencrypted.",
+                  "Open with no splash page; traffic is unencrypted.",
                   "Use WPA2/3, or Enhanced Open (OWE) with a splash page for guest networks.",
                   resource=name)
         elif auth == "open":
             s.add("MEDIUM", "WL-SSID-03", cat, "Open (unencrypted) guest SSID",
-                  f"'{name}' is open with a '{ssid.get('splashPage')}' splash page; over-the-air "
-                  "traffic is unencrypted.",
-                  "Use Enhanced Open (OWE) or WPA3/WPA2-PSK for guests.", resource=name)
+                  "Over-the-air traffic is unencrypted.",
+                  "Use Enhanced Open (OWE) or WPA3/WPA2-PSK for guests.", resource=name,
+                  item=f"Splash page: {ssid.get('splashPage')}.")
         if "wpa1" in wpa:
             sev = "HIGH" if wpa == "wpa1 only" else "MEDIUM"
             s.add(sev, "WL-SSID-04", cat, "SSID allows WPA1/TKIP",
-                  f"'{name}' WPA mode is '{ssid.get('wpaEncryptionMode')}'.",
-                  "Use 'WPA2 only' or WPA3.", resource=name)
+                  "WPA1/TKIP is deprecated and weak.",
+                  "Use 'WPA2 only' or WPA3.", resource=name,
+                  item=f"WPA mode: {ssid.get('wpaEncryptionMode')}.")
         if auth == "psk":
             psk = ssid.get("psk")
             if isinstance(psk, str) and psk:
@@ -1272,27 +1410,35 @@ def check_ssids(s: Scope) -> None:
                 if issues:
                     s.add("HIGH" if len(psk) < 10 else "MEDIUM", "WL-SSID-05", cat,
                           "Weak Wi-Fi pre-shared key",
-                          f"'{name}' PSK is weak: {', '.join(issues)}. (Value not shown.)",
+                          "The PSK is checked locally and never shown in the report.",
                           f"Use a random passphrase of {s.cfg.min_psk_length}+ characters and "
-                          "rotate it regularly.", resource=name)
+                          "rotate it regularly.", resource=name,
+                  item=f"PSK is weak: {', '.join(issues)}.")
             if mode == "bridge mode":
                 s.add("LOW", "WL-SSID-06", cat, "Shared PSK on bridged (internal) SSID",
-                      f"'{name}' bridges clients onto the LAN with a shared PSK.",
+                      "Bridges clients onto the LAN with a shared PSK.",
                       "Use 802.1X (WPA2/3-Enterprise) or iPSK for internal networks.", resource=name)
         if (is_open or has_splash) and mode in ("bridge mode", "layer 3 roaming"):
             s.add("HIGH", "WL-SSID-07", cat, "Guest/open SSID bridged into the LAN",
-                  f"'{name}' is open/splash but bridged ('{ssid.get('ipAssignmentMode')}').",
+                  "Open/splash SSID puts guests on the LAN.",
                   "Use NAT mode or a dedicated guest VLAN with ACLs; enable client isolation.",
-                  resource=name)
+                  resource=name,
+                  item=f"IP assignment: {ssid.get('ipAssignmentMode')}.")
         if (is_open or has_splash) and mode == "bridge mode" and not ssid.get("lanIsolationEnabled"):
             s.add("MEDIUM", "WL-SSID-08", cat, "Client isolation disabled on guest SSID",
-                  f"'{name}' clients can reach each other.",
+                  "Guest clients can reach each other.",
                   "Enable LAN isolation on guest SSIDs.", resource=name)
         if "802.1x" in auth or "8021x" in auth:
             if not ssid.get("radiusServers") and auth == "8021x-radius":
                 s.add("MEDIUM", "WL-SSID-09", cat, "802.1X SSID without RADIUS servers",
-                      f"'{name}' is set to 802.1X-RADIUS but has no RADIUS servers.",
+                      "Set to 802.1X-RADIUS but has no RADIUS servers.",
                       "Configure redundant RADIUS servers.", resource=name)
+        plain = _radius_without_radsec(ssid.get("radiusServers"), lambda r: r.get("radsecEnabled"))
+        if plain:
+            _radsec_finding(s, "WL-RADSEC-01", cat, f"SSID '{name}'", plain,
+                            "Enable RadSec (RADIUS over TLS) on the SSID's RADIUS servers; it "
+                            "requires the Meraki cloud RADIUS proxy and a RadSec-capable server. "
+                            "Otherwise keep RADIUS on a trusted, private path.", resource=name)
 
         # Guest / PSK SSIDs should not reach the LAN
         if is_open or has_splash or auth == "psk":
@@ -1301,7 +1447,7 @@ def check_ssids(s: Scope) -> None:
                         s.net["id"], ssid.get("number"))
             if fw and fw.get("allowLanAccess") and (is_open or has_splash):
                 s.add("HIGH", "WL-SSID-10", cat, "Guest SSID allows wireless clients LAN access",
-                      f"'{name}' has 'Wireless clients accessing LAN' set to allow.",
+                      "'Wireless clients accessing LAN' is set to allow.",
                       "Deny LAN access on the SSID's L3 firewall for guest networks.", resource=name)
 
 
@@ -1334,9 +1480,9 @@ def check_ap_usb(s: Scope) -> None:
         aps = len(p.get("assignments") or [])
         scope = "default profile" if p.get("isDefault") else f"assigned to {aps} AP(s)"
         s.add("LOW", "WL-USB-01", "Wireless", "AP USB port enabled",
-              f"AP port profile '{name}' ({scope}) has enabled USB port(s): {_short(enabled)}.",
+              "AP USB port is enabled in the port profile.",
               "Disable the AP USB port in the port profile unless a USB device is required.",
-              resource=name)
+              resource=name, item=f"Profile '{name}' ({scope}): {_short(enabled)}.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1361,6 +1507,7 @@ def check_switch_network(s: Scope) -> None:
             s.add("LOW", "SW-DHCP-02", cat, "No alert for new DHCP servers",
                   "DHCP server guard email alerts are disabled.",
                   "Enable alerts when new DHCP servers are seen.")
+        check_dai(s, dhcp.get("arpInspection"))
     pols = s.call("switch-access-policies", s.d.switch.getNetworkSwitchAccessPolicies, s.net["id"])
     if pols is not None and not pols:
         s.add("INFO", "SW-NAC-01", cat, "No 802.1X/MAB access policies",
@@ -1370,15 +1517,66 @@ def check_switch_network(s: Scope) -> None:
         check_access_policy(s, pol)
 
 
+def check_dai(s: Scope, dai: dict | None) -> None:
+    """Dynamic ARP Inspection: network-wide state, then per-port 'Trusted DAI'.
+    daiTrusted is only in the per-switch port list, so those calls are made only
+    when DAI is on (with DAI off, trusted ports have no effect)."""
+    if dai is None:  # field absent: older API/firmware, state unknown
+        return
+    cat = "Switching"
+    if not dai.get("enabled"):
+        s.add("MEDIUM", "SW-DAI-01", cat, "Dynamic ARP Inspection disabled",
+              "Switches do not validate ARP against DHCP snooping bindings, so any client can "
+              "spoof the gateway's or another host's IP (ARP poisoning / man-in-the-middle).",
+              "Switching > DHCP servers & ARP: enable Dynamic ARP Inspection, mark only uplinks "
+              "and trunks to other switches/routers as Trusted DAI, and add static-IP hosts "
+              "as trusted servers.")
+        return
+    unsupported = dai.get("unsupportedModels") or []
+    if unsupported:
+        s.add("LOW", "SW-DAI-02", cat, "Switch models that cannot enforce DAI",
+              f"DAI is enabled, but these models in the network do not support it and do not "
+              f"inspect ARP: {_short(unsupported)}.",
+              "Replace these switches or keep untrusted clients off them.")
+
+    devices = s.call("network-devices", s.d.networks.getNetworkDevices, s.net["id"]) or []
+    switches = [d for d in devices if lower(d.get("productType")) == "switch"
+                or (not d.get("productType") and lower(d.get("model")).startswith("ms"))]
+    for sw in switches:
+        name = sw.get("name") or sw.get("serial")
+        ports = s.call(f"switch-ports-{sw.get('serial')}", s.d.switch.getDeviceSwitchPorts,
+                       sw.get("serial"))
+        if not ports:
+            continue
+        enabled = [p for p in ports if p.get("enabled", True)]
+        if not any("daiTrusted" in p for p in enabled):
+            continue  # field not reported: state unknown
+        trusted_access = [str(p.get("portId")) for p in enabled
+                          if p.get("daiTrusted") and lower(p.get("type")) == "access"]
+        if trusted_access:
+            s.add("MEDIUM", "SW-DAI-03", cat, "Access ports set to Trusted DAI",
+                  "These ports skip ARP inspection, so a client on them can still ARP-spoof.",
+                  "Untick Trusted DAI on access ports; trust only uplinks and inter-switch or "
+                  "router trunks. Use DAI trusted servers for static-IP hosts.", resource=name,
+                  item=f"{len(trusted_access)} access port(s): {_short(trusted_access, 12)}.")
+        if (any(lower(p.get("type")) == "trunk" for p in enabled)
+                and not any(p.get("daiTrusted") for p in enabled
+                            if lower(p.get("type")) == "trunk" or is_uplink_port(p))):
+            s.add("INFO", "SW-DAI-04", cat, "DAI enabled but no trusted uplink",
+                  "The switch has trunk ports but none is Trusted DAI, so ARP from upstream "
+                  "switches/routers is inspected and may be dropped.",
+                  "Mark the uplink trunk as Trusted DAI.", resource=name)
+
+
 def check_access_policy(s: Scope, pol: dict) -> None:
     cat = "Switching"
     name = pol.get("name") or f"#{pol.get('accessPolicyNumber', '?')}"
     res = f"access policy {name}"
     if lower(pol.get("hostMode")) == "multi-host":
         s.add("MEDIUM", "SW-NAC-02", cat, "802.1X access policy in Multi-Host mode",
-              f"Access policy '{name}' uses Multi-Host: once the first device on a port "
-              "authenticates, every other device on that port (e.g. behind a hub or a phone's "
-              "PC port) is admitted without authenticating.",
+              "Once the first device on a port authenticates, every other device on that "
+              "port (e.g. behind a hub or a phone's PC port) is admitted without "
+              "authenticating.",
               "Use Single-Host, Multi-Domain (phone + PC) or Multi-Auth so each device "
               "authenticates.", resource=res)
     if "radiusServers" in pol:
@@ -1392,6 +1590,14 @@ def check_access_policy(s: Scope, pol: dict) -> None:
                   f"Access policy '{name}' has one RADIUS server ({servers[0].get('host', '?')}). "
                   "If it is unreachable, ports fall back to critical-auth behaviour or deny access.",
                   "Add a second RADIUS server, ideally at another site.", resource=res)
+    servers = [*(pol.get("radiusServers") or []), *(pol.get("radiusAccountingServers") or [])]
+    plain = _radius_without_radsec(
+        servers, lambda r: (r.get("radsec") or {}).get("enabled") if "radsec" in r else None)
+    if plain:
+        _radsec_finding(s, "SW-RADSEC-01", cat, f"Access policy '{name}'", sorted(set(plain)),
+                        "Enable RadSec on the access policy's RADIUS servers (switch firmware "
+                        "and RADIUS server must support it), or keep RADIUS on a trusted, "
+                        "private management path.", resource=res)
     if pol.get("radiusAccountingEnabled") is False:
         s.add("LOW", "SW-NAC-04", cat, "RADIUS accounting disabled on access policy",
               f"Access policy '{name}' does not send RADIUS accounting, so there is no record "
@@ -1470,7 +1676,8 @@ def audit_org(dashboard, cfg: AuditConfig, out: Collector, org: dict,
     if network_tags:
         networks = [n for n in networks if network_tags & set(n.get("tags", []))]
     names = {n["id"]: n["name"] for n in networks}
-    check_config_changes(s, admins, saml, names if (network_ids or network_tags) else None)
+    changes = check_config_changes(s, admins, saml, names if (network_ids or network_tags) else None)
+    check_support_access(s, changes)
 
     if any("wireless" in n.get("productTypes", []) for n in networks):
         check_air_marshal(s, names)
@@ -1498,23 +1705,76 @@ def summary_counts(findings: list[Finding]) -> dict[str, int]:
     return {sev: sum(1 for f in findings if f.severity == sev) for sev in reversed(SEVERITIES)}
 
 
-def render_text(findings: list[Finding], skipped: list[Skipped], verbose: bool) -> str:
+@dataclass
+class Group:
+    """Findings of one check that share severity, title and fix."""
+    findings: list[Finding]
+
+    @property
+    def first(self) -> Finding:
+        return self.findings[0]
+
+    @property
+    def common_detail(self) -> str | None:
+        """The explanation shared by every finding, or None if they differ."""
+        whys = {f.why if f.item else f.detail for f in self.findings}
+        return next(iter(whys)) if len(whys) == 1 else None
+
+    def affected(self, f: Finding) -> str:
+        where = f.org_name + (f" / {f.network_name}" if f.network_name else "")
+        what = f.item if (f.item and self.common_detail is not None) else (
+            "" if self.common_detail is not None else f.detail)
+        return " - ".join(x for x in (where, f.resource, what) if x)
+
+
+def group_findings(findings: list[Finding], enabled: bool = True) -> list[Group]:
+    """Keeps the input order (sorted by severity), each group at its first finding."""
+    if not enabled:
+        return [Group([f]) for f in findings]
+    groups: dict[tuple, Group] = {}
+    for f in findings:
+        key = (f.severity, f.check_id, f.title, f.recommendation)
+        groups.setdefault(key, Group([])).findings.append(f)
+    return list(groups.values())
+
+
+def _summary_line(findings: list[Finding], groups: list[Group]) -> str:
+    line = "  ".join(f"{k}: {v}" for k, v in summary_counts(findings).items())
+    if len(groups) < len(findings):
+        line += f"   ({len(findings)} findings in {len(groups)} distinct issues)"
+    return line
+
+
+def render_text(findings: list[Finding], skipped: list[Skipped], verbose: bool,
+                group: bool = True) -> str:
     color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     colors = {"CRITICAL": "\033[1;37;41m", "HIGH": "\033[1;31m", "MEDIUM": "\033[33m",
               "LOW": "\033[36m", "INFO": "\033[2m"}
     reset = "\033[0m" if color else ""
+    groups = group_findings(findings, group)
     buf = io.StringIO()
     buf.write(f"\nMeraki Security Audit - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
     buf.write("=" * 72 + "\n")
-    counts = summary_counts(findings)
-    buf.write("  ".join(f"{k}: {v}" for k, v in counts.items()) + "\n\n")
-    for f in findings:
+    buf.write(_summary_line(findings, groups) + "\n\n")
+    for g in groups:
+        f = g.first
         c = colors[f.severity] if color else ""
-        where = f.org_name + (f" / {f.network_name}" if f.network_name else "")
-        buf.write(f"{c}[{f.severity}]{reset} {f.check_id}  {f.title}\n")
-        buf.write(f"    Scope : {where}\n")
-        buf.write(f"    Detail: {f.detail}\n")
-        buf.write(f"    Fix   : {f.recommendation}\n\n")
+        n = len(g.findings)
+        buf.write(f"{c}[{f.severity}]{reset} {f.check_id}  {f.title}"
+                  + (f"  ({n} affected)" if n > 1 else "") + "\n")
+        if n == 1:
+            where = f.org_name + (f" / {f.network_name}" if f.network_name else "")
+            buf.write(f"    Scope : {where}" + (f" - {f.resource}" if f.resource else "") + "\n")
+            buf.write(f"    Detail: {f.detail}\n")
+            buf.write(f"    Fix   : {f.recommendation}\n\n")
+            continue
+        if g.common_detail:
+            buf.write(f"    Detail: {g.common_detail}\n")
+        buf.write(f"    Fix   : {f.recommendation}\n")
+        buf.write("    Affected:\n")
+        for x in g.findings:
+            buf.write(f"      - {g.affected(x)}\n")
+        buf.write("\n")
     if skipped:
         buf.write(f"{len(skipped)} check(s) skipped (not applicable, unlicensed, or no permission).")
         if verbose:
@@ -1526,18 +1786,31 @@ def render_text(findings: list[Finding], skipped: list[Skipped], verbose: bool) 
     return buf.getvalue()
 
 
-def render_markdown(findings: list[Finding], skipped: list[Skipped]) -> str:
+def render_markdown(findings: list[Finding], skipped: list[Skipped], group: bool = True) -> str:
     def esc(v: str) -> str:
         return str(v).replace("|", "\\|").replace("\n", " ")
+    groups = group_findings(findings, group)
     lines = ["# Meraki Security Audit", "",
              f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", "",
              "## Summary", "", "| Severity | Count |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in summary_counts(findings).items()]
+    if len(groups) < len(findings):
+        lines += ["", f"{len(findings)} findings in {len(groups)} distinct issues."]
     lines += ["", "## Findings", "",
-              "| Severity | ID | Organization | Network | Finding | Detail | Recommendation |",
-              "|---|---|---|---|---|---|---|"]
-    lines += [f"| {f.severity} | {f.check_id} | {esc(f.org_name)} | {esc(f.network_name)} | "
-              f"{esc(f.title)} | {esc(f.detail)} | {esc(f.recommendation)} |" for f in findings]
+              "| Severity | ID | Finding | Affected | Detail | Recommendation |",
+              "|---|---|---|---|---|---|"]
+    for g in groups:
+        f = g.first
+        if len(g.findings) == 1:
+            where = f.org_name + (f" / {f.network_name}" if f.network_name else "")
+            affected, detail = " - ".join(x for x in (where, f.resource) if x), f.detail
+        else:
+            affected = "<br>".join(f"{esc(g.affected(x))}" for x in g.findings)
+            detail = g.common_detail or ""
+        lines.append(f"| {f.severity} | {f.check_id} | {esc(f.title)}"
+                     + (f" ({len(g.findings)})" if len(g.findings) > 1 else "")
+                     + f" | {esc(affected) if len(g.findings) == 1 else affected} | "
+                     f"{esc(detail)} | {esc(f.recommendation)} |")
     if skipped:
         lines += ["", "## Skipped checks", "", "| Scope | Check | Reason |", "|---|---|---|"]
         lines += [f"| {esc(s.scope)} | {s.check} | {esc(s.reason)} |" for s in skipped]
@@ -1546,11 +1819,10 @@ def render_markdown(findings: list[Finding], skipped: list[Skipped]) -> str:
 
 def render_csv(findings: list[Finding]) -> str:
     buf = io.StringIO()
-    cols = list(Finding.__dataclass_fields__)
-    w = csv.DictWriter(buf, fieldnames=cols)
+    w = csv.DictWriter(buf, fieldnames=EXPORT_FIELDS)
     w.writeheader()
     for f in findings:
-        w.writerow(asdict(f))
+        w.writerow(finding_dict(f))
     return buf.getvalue()
 
 
@@ -1559,7 +1831,7 @@ def render_json(findings: list[Finding], skipped: list[Skipped]) -> str:
         "tool": "meraki_audit", "version": __version__,
         "generated": datetime.now(timezone.utc).isoformat(),
         "summary": summary_counts(findings),
-        "findings": [asdict(f) for f in findings],
+        "findings": [finding_dict(f) for f in findings],
         "skipped": [asdict(s) for s in skipped],
     }, indent=2)
 
@@ -1636,6 +1908,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Flag admins inactive longer than this")
     p.add_argument("--max-full-admins", type=int, default=5)
     p.add_argument("--min-psk-length", type=int, default=12)
+    p.add_argument("--min-password-length", type=int, default=12,
+                   help="Minimum Dashboard admin password length")
+    p.add_argument("--password-history", type=int, default=4,
+                   help="Minimum number of previous passwords that may not be reused")
     p.add_argument("--firmware-max-age-days", type=int, default=365)
     p.add_argument("--log-days", type=int, default=30,
                    help="Look-back for the API request log (max 31) and change log (max 365)")
@@ -1651,6 +1927,9 @@ def build_parser() -> argparse.ArgumentParser:
     net.add_argument("--no-system-certs", action="store_true",
                      help="Do not use the OS trust store (macOS Keychain / Windows cert store) "
                           "even if the 'truststore' package is installed")
+    p.add_argument("--no-group", action="store_true",
+                   help="text/markdown: one entry per finding instead of grouping the same issue "
+                        "across networks and devices")
     p.add_argument("-v", "--verbose", action="store_true", help="List skipped checks")
     p.add_argument("-q", "--quiet", action="store_true", help="No progress output on stderr")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1687,6 +1966,8 @@ def main(argv: list[str] | None = None, dashboard=None) -> int:
         inactive_days=args.inactive_days,
         max_full_admins=args.max_full_admins,
         min_psk_length=args.min_psk_length,
+        min_password_length=args.min_password_length,
+        password_history_min=args.password_history,
         firmware_max_age_days=args.firmware_max_age_days,
         log_days=args.log_days,
         trusted_domains=[d.lower().lstrip("@") for d in args.trusted_domain],
@@ -1728,9 +2009,9 @@ def main(argv: list[str] | None = None, dashboard=None) -> int:
     elif args.format == "csv":
         report = render_csv(findings)
     elif args.format == "markdown":
-        report = render_markdown(findings, out.skipped)
+        report = render_markdown(findings, out.skipped, group=not args.no_group)
     else:
-        report = render_text(findings, out.skipped, args.verbose)
+        report = render_text(findings, out.skipped, args.verbose, group=not args.no_group)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8", newline="") as fh:
