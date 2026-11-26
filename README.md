@@ -74,8 +74,9 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
 | **Meraki Support access** | Support access unblocked (latest change to *Block Meraki Support* in the change log), configuration changes made by Meraki Support (look-back `--log-days`) |
 | **SSO** | SAML enabled, IdP configured, SAML roles with full access |
 | **SNMP** | Dashboard SNMP v2c, MD5/DES on v3, no peer IP restriction; device SNMP community mode |
-| **VPN** | 3rd-party peers: IKEv1, default (weak) IPsec preset, DES/3DES/MD5/SHA1/DH 1/2/5, short PSK, scoping; site-to-site VPN firewall rules, including rules hidden by an earlier rule |
-| **MX firewall** | any/any allow rules, rules that never match because an earlier rule covers them (conflicting → MEDIUM, redundant → INFO), no deny rules, undocumented rules, no syslog on rules, inbound rules from any source, port forwards / 1:1 / 1:many NAT open to the internet (sensitive ports → HIGH), WAN web/SNMP services unrestricted, passthrough mode, IP spoofing protection not set to block |
+| **VPN** | 3rd-party peers: IKEv1, default (weak) IPsec preset, DES/3DES/MD5/SHA1/DH 1/2/5, short PSK, scoping; site-to-site VPN firewall rules (any/any allow → HIGH), including rules hidden by an earlier rule |
+| **Org-wide group policies** | any/any allow rules in an attached ruleset (HIGH), empty ruleset attached to a policy (enforced as allow any→any, HIGH), policy with enforcement targets but no rulesets, policy without targets, unused rulesets, deny rules without logging, disabled rules, rules hidden by an earlier rule in the same ruleset; network MX firewall findings note which VLANs an org-wide policy governs instead |
+| **MX firewall** | any/any allow rules (HIGH), rules that never match because an earlier rule covers them (conflicting → MEDIUM, redundant → INFO), no deny rules, undocumented rules, no syslog on rules, inbound rules from any source, port forwards / 1:1 / 1:many NAT open to the internet (sensitive ports → HIGH), WAN web/SNMP services unrestricted, passthrough mode, IP spoofing protection not set to block |
 | **MX threat protection** | IDS/IPS disabled or detection-only, weak ruleset, AMP disabled, no blocked URL categories |
 | **Wireless** | WEP, open SSIDs, WPA1/TKIP, weak PSKs, shared PSK on bridged SSIDs, guest SSIDs bridged into LAN, no client isolation, guest LAN access allowed, 802.1X without RADIUS, RADIUS servers without RadSec (public RADIUS host → MEDIUM), Air Marshal default policy, AP Bluetooth scanning / BLE beacon advertising on, AP USB ports enabled in port profiles |
 | **Switching** | uplink trunk missing VLANs used by the switch's access ports, RSTP disabled, rogue DHCP not blocked / no alert, Dynamic ARP Inspection off, access ports set to Trusted DAI, DAI-enabled switch without a trusted uplink, switch models that cannot enforce DAI, no 802.1X policies, 802.1X Multi-Host mode, fewer than two RADIUS servers, RADIUS (auth or accounting) servers without RadSec, RADIUS accounting off, fail-open critical-auth VLAN, trunks allowing all VLANs, native VLAN 1, access ports in VLAN 1, no BPDU guard |
@@ -95,6 +96,13 @@ The first line on stderr (`[tls] ...`) shows which trust source is in use.
   covers everything, a CIDR covers its subnets, ports compare as sets, and anything else
   (`VLAN(30).*`, FQDNs) must match exactly. Shadowing written in different notations is
   missed, but it is not invented.
+- **Org-wide group policies (`ORG-OGP-*`)**: Meraki documents that an *empty* ruleset attached to a
+  policy is enforced as allow any→any (`ORG-OGP-02`), but not what a policy with targets and *no*
+  ruleset enforces, so `ORG-OGP-03` is LOW and asks you to verify. Shadowing (`ORG-OGP-08`) is
+  checked within one ruleset only, because the order across rulesets is not clearly documented,
+  and only for rules that use address ranges, ports or a single service; rules with VLANs, objects,
+  applications, FQDNs, countries or SGTs are not compared. Org-wide policy findings are not
+  narrowed by `--network-id` / `--network-tag`.
 - **AP USB ports (`WL-USB-01`)**: read from the AP port profiles, which only exist for AP
   models with configurable ports. Networks without such APs are skipped (shown with `-v`), so
   no finding there does not prove a USB port is disabled. Bluetooth (`WL-BT-01/02`) is a

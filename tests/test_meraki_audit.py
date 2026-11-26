@@ -666,3 +666,92 @@ def test_webhook_public_ip_info(capsys):
     assert ids == {"NET-HOOK-05"}
     assert ma.webhook_host("https://u:p@[2001:db8::1]:8443/t?k=v") == (
         "https", "2001:db8::1", "https://[2001:db8::1]:8443")
+
+
+def ogp_rule(rid, rs, name, policy, prio, src=None, dst=None, enabled=True, log=True):
+    def side(c):
+        if not c:
+            return {"matchCriteria": ["any"], "criteria": {}}
+        return {"matchCriteria": list(c), "criteria": c}
+    return {"ruleId": rid, "rulesetId": rs, "name": name, "policy": policy, "priority": prio,
+            "enabled": enabled, "logging": {"enabled": log}, "sources": side(src), "destinations": side(dst)}
+
+
+def org_group_policies(data):
+    data["getOrganizationPoliciesGlobalGroupPolicies"] = {"items": [
+        {"policyId": "P1", "name": "Stores"}, {"policyId": "P2", "name": "NoRules"},
+        {"policyId": "P3", "name": "Orphan"}, {"policyId": "P4", "name": "EmptyRs"}]}
+    data["getOrganizationPoliciesGlobalFirewallRulesets"] = {"items": [
+        {"rulesetId": "R1", "name": "store-out"}, {"rulesetId": "R2", "name": "empty"},
+        {"rulesetId": "R3", "name": "unused"}]}
+    data["getOrganizationPoliciesGlobalFirewallRulesetsRules"] = {"items": [
+        ogp_rule("1", "R1", "web", "allow", 1, src={"addressRanges": ["10.0.0.0/8"]},
+                 dst={"services": [{"protocol": "tcp", "ports": ["80", "443"]}]}),
+        ogp_rule("2", "R1", "block lab web", "deny", 2, src={"addressRanges": ["10.9.0.0/16"]},
+                 dst={"services": [{"protocol": "tcp", "ports": ["443"]}]}, log=False),
+        ogp_rule("3", "R1", "gmail", "deny", 3, dst={"applications": [{"id": "meraki:layer7/application/5"}]}),
+        ogp_rule("4", "R1", "old", "deny", 4, enabled=False),
+        ogp_rule("5", "R1", "allow all", "allow", 5),
+        ogp_rule("6", "R3", "anything", "allow", 1)]}
+    data["getOrganizationPoliciesGlobalGroupPoliciesFirewallRulesetsAssignments"] = {"items": [
+        {"assignmentId": "A1", "rulesetId": "R1", "policyId": "P1", "priority": 1},
+        {"assignmentId": "A2", "rulesetId": "R2", "policyId": "P4", "priority": 1}]}
+    data["getOrganizationPoliciesGlobalGroupPoliciesApplianceVlansAssignments"] = {"items": [
+        {"assignmentId": "V1", "policyId": "P1", "interfaceId": "N1_vlan_20"},
+        {"assignmentId": "V2", "policyId": "P2", "interfaceId": "N1_vlan_30"},
+        {"assignmentId": "V3", "policyId": "P4", "interfaceId": "N2_vlan_40"}]}
+    data["getOrganizationPoliciesGlobalGroupPoliciesAdaptivePolicyGroupsAssignments"] = {"items": []}
+    data["getOrganizationPoliciesGlobalGroupPoliciesNetworksAssignments"] = {"items": []}
+    return data
+
+
+def test_org_group_policies(capsys):
+    _, out, ids = run(org_group_policies(hardened()), capsys=capsys)
+    ogp = {(f["check_id"], f["severity"], f["resource"]) for f in out["findings"]
+           if f["check_id"].startswith("ORG-OGP")}
+    assert ogp == {
+        ("ORG-OGP-01", "HIGH", "ruleset store-out rule 4"),     # 4th active rule ('old' is disabled)
+        ("ORG-OGP-02", "HIGH", "ruleset empty"),
+        ("ORG-OGP-03", "LOW", "policy NoRules"),
+        ("ORG-OGP-04", "INFO", "policy Orphan"),
+        ("ORG-OGP-05", "INFO", "ruleset unused"),               # its any/any rule is not enforced
+        ("ORG-OGP-06", "LOW", "ruleset store-out"),
+        ("ORG-OGP-07", "INFO", "ruleset store-out"),
+        ("ORG-OGP-08", "MEDIUM", "ruleset store-out rule 2"),   # deny 10.9/16:443 under allow 10/8:80,443
+    }
+    assert ids == {f[0] for f in ogp}
+    no_log = next(f for f in out["findings"] if f["check_id"] == "ORG-OGP-06")
+    assert "block lab web" in no_log["detail"] and "gmail" not in no_log["detail"]
+
+
+def test_org_group_policy_vlans_annotate_network_firewall(capsys):
+    _, out, _ = run(org_group_policies(insecure()), capsys=capsys)
+    fw = next(f for f in out["findings"] if f["check_id"] == "MX-FW-02" and f["network_id"] == "N1")
+    assert fw["severity"] == "HIGH"
+    assert "20 (org-wide policy 'Stores')" in fw["detail"] and "30 (org-wide policy 'NoRules')" in fw["detail"]
+
+
+def test_org_group_policies_unavailable_is_skipped(capsys):
+    _, out, ids = run(hardened(), "-v", capsys=capsys)
+    assert not any(i.startswith("ORG-OGP") for i in ids)
+    assert any(s["check"] == "org-group-policies" for s in out["skipped"])
+
+
+def test_ogp_as_l3():
+    assert ma.ogp_as_l3(ogp_rule("1", "R", "x", "allow", 1)) == {
+        "policy": "allow", "comment": "x", "protocol": "any",
+        "srcCidr": "Any", "srcPort": "Any", "destCidr": "Any", "destPort": "Any"}
+    assert ma.ogp_as_l3(ogp_rule("1", "R", "x", "deny", 1, dst={"fqdns": ["*.example.com"]})) is None
+    two = {"services": [{"protocol": "tcp", "ports": ["22"]}, {"protocol": "udp", "ports": ["53"]}]}
+    assert ma.ogp_as_l3(ogp_rule("1", "R", "x", "deny", 1, dst=two)) is None
+
+
+def test_all_firewall_any_any_rules_are_high(capsys):
+    data = org_group_policies(insecure())
+    data["getOrganizationApplianceVpnVpnFirewallRules"] = {"rules": [
+        {"comment": "open", "policy": "allow", "protocol": "any", "srcCidr": "Any", "destCidr": "Any",
+         "destPort": "Any"}, {"comment": "Default rule", "policy": "allow"}]}
+    _, out, _ = run(data, capsys=capsys)
+    sev = {f["check_id"]: f["severity"] for f in out["findings"]
+           if f["check_id"] in ("MX-FW-02", "ORG-VPN-07", "ORG-OGP-01", "ORG-OGP-02")}
+    assert sev == dict.fromkeys(("MX-FW-02", "ORG-VPN-07", "ORG-OGP-01", "ORG-OGP-02"), "HIGH")

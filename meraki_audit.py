@@ -693,10 +693,183 @@ def check_vpn_firewall(s: Scope) -> None:
         if (lower(r.get("policy")) == "allow" and is_any(r.get("srcCidr"))
                 and is_any(r.get("destCidr")) and parse_ports(r.get("destPort")) is None
                 and lower(r.get("protocol")) == "any"):
-            s.add("LOW", "ORG-VPN-07", "VPN", "Any/any allow rule in VPN firewall",
+            s.add("HIGH", "ORG-VPN-07", "VPN", "Any/any allow rule in VPN firewall",
                   f"Rule '{r.get('comment') or '(no comment)'}' allows all traffic.",
                   "Replace with specific allow rules.")
     report_shadowed(s, rules, "ORG-VPN-08", "VPN", "VPN firewall")
+
+
+# Organization-wide group policies (Security > Group Policy, MX 26.1.2+): firewall
+# rulesets defined once and enforced on MX VLANs, SGTs or network VPN-inbound targets.
+# Network L3 firewall rules do not apply to a VLAN that is an enforcement target.
+
+_OGP_MAPPABLE = {"src": {"addressRanges", "ports"},
+                 "dst": {"addressRanges", "ports", "services"}}
+_VLAN_IFACE = re.compile(r"^(?P<net>.+)_vlan_(?P<vlan>\d+)$")
+
+
+def _items(resp: Any) -> list[dict]:
+    if isinstance(resp, dict):
+        return resp.get("items") or []
+    return resp or []
+
+
+def ogp_as_l3(rule: dict) -> dict | None:
+    """Express an org-wide rule as a network L3 rule (srcCidr/destCidr/ports/protocol)
+    so rule_covers() can compare it. None when it uses criteria an L3 rule has no
+    field for (VLANs, objects, apps, FQDNs, countries, SGTs, several services)."""
+    out = {"policy": lower(rule.get("policy")), "comment": rule.get("name"), "protocol": "any"}
+    for side, cidr, port in (("src", "srcCidr", "srcPort"), ("dst", "destCidr", "destPort")):
+        blk = rule.get("sources" if side == "src" else "destinations") or {}
+        mc = set(blk.get("matchCriteria") or []) - {"any"}
+        crit = blk.get("criteria") or {}
+        if mc - _OGP_MAPPABLE[side]:
+            return None
+        out[cidr] = ",".join(crit.get("addressRanges") or []) if "addressRanges" in mc else "Any"
+        out[port] = ",".join(crit.get("ports") or []) if "ports" in mc else "Any"
+        if "services" in mc:
+            svcs = crit.get("services") or []
+            if len(svcs) != 1 or "ports" in mc:
+                return None
+            out["protocol"] = lower(svcs[0].get("protocol")) or "any"
+            out[port] = ",".join(svcs[0].get("ports") or []) or "Any"
+        if not out[cidr]:
+            return None
+    return out
+
+
+def check_org_group_policies(s: Scope) -> dict[str, dict[int, str]]:
+    """Returns {network id: {VLAN id: policy name}} for VLANs enforced by an org-wide policy."""
+    org_id, cat = s.org["id"], "Firewall"
+    o = s.d.organizations
+    policies = s.call("org-group-policies", o.getOrganizationPoliciesGlobalGroupPolicies,
+                      org_id, total_pages="all")
+    if policies is None:
+        return {}
+    policies = _items(policies)
+    if not policies:
+        return {}
+    rulesets = _items(s.call("org-fw-rulesets", o.getOrganizationPoliciesGlobalFirewallRulesets,
+                             org_id, total_pages="all"))
+    rules_resp = s.call("org-fw-rules", o.getOrganizationPoliciesGlobalFirewallRulesetsRules,
+                        org_id, total_pages="all")
+    attach_resp = s.call("org-group-policy-rulesets",
+                         o.getOrganizationPoliciesGlobalGroupPoliciesFirewallRulesetsAssignments,
+                         org_id, total_pages="all")
+    if rules_resp is None or attach_resp is None:
+        return {}  # skipped already recorded; rule checks would be guesses without these
+    vlan_resp = s.call("org-group-policy-vlans",
+                       s.d.appliance.getOrganizationPoliciesGlobalGroupPoliciesApplianceVlansAssignments,
+                       org_id, total_pages="all")
+    sgt_resp = s.call("org-group-policy-sgts",
+                      o.getOrganizationPoliciesGlobalGroupPoliciesAdaptivePolicyGroupsAssignments,
+                      org_id, total_pages="all")
+    net_resp = s.call("org-group-policy-networks",
+                      o.getOrganizationPoliciesGlobalGroupPoliciesNetworksAssignments,
+                      org_id, total_pages="all")
+    targets_known = None not in (vlan_resp, sgt_resp, net_resp)
+
+    pol_name = {p.get("policyId"): p.get("name") or p.get("policyId") for p in policies}
+    rs_name = {r.get("rulesetId"): r.get("name") or r.get("rulesetId") for r in rulesets}
+    by_ruleset: dict[str, list[dict]] = {}
+    for r in _items(rules_resp):
+        by_ruleset.setdefault(r.get("rulesetId"), []).append(r)
+        rs_name.setdefault(r.get("rulesetId"), r.get("rulesetId"))
+    attached: dict[str, list[str]] = {}  # ruleset id -> policy ids
+    pol_rulesets: dict[str, list[str]] = {}
+    for a in _items(attach_resp):
+        attached.setdefault(a.get("rulesetId"), []).append(a.get("policyId"))
+        pol_rulesets.setdefault(a.get("policyId"), []).append(a.get("rulesetId"))
+
+    targets: dict[str, list[str]] = {}
+    vlans: dict[str, dict[int, str]] = {}
+    for a in _items(vlan_resp):
+        m = _VLAN_IFACE.match(str(a.get("interfaceId", "")))
+        targets.setdefault(a.get("policyId"), []).append(
+            f"VLAN {m['vlan']} ({m['net']})" if m else str(a.get("interfaceId")))
+        if m:
+            vlans.setdefault(m["net"], {})[int(m["vlan"])] = pol_name.get(a.get("policyId"), "?")
+    for a in _items(sgt_resp):
+        targets.setdefault(a.get("policyId"), []).append(f"SGT {a.get('adaptivePolicyGroupId')}")
+    for a in _items(net_resp):
+        pid = (a.get("policy") or {}).get("id")
+        net = a.get("network") or {}
+        targets.setdefault(pid, []).append(
+            f"{(a.get('firewall') or {}).get('type', 'network')} on {net.get('name') or net.get('id')}")
+
+    def where(rs_id: str) -> str:
+        return ", ".join(sorted(f"'{pol_name.get(p, p)}'" for p in attached.get(rs_id, [])))
+
+    for pid, name in pol_name.items():
+        tg = targets.get(pid, [])
+        if targets_known and not tg:
+            s.add("INFO", "ORG-OGP-04", cat, "Org-wide group policy has no enforcement targets",
+                  "The policy is not applied to any VLAN, SGT or network, so its rules have no effect.",
+                  "Assign enforcement targets or delete the policy.", resource=f"policy {name}",
+                  item=f"Policy '{name}':")
+        if tg and not pol_rulesets.get(pid):
+            s.add("LOW", "ORG-OGP-03", cat, "Org-wide group policy has targets but no rulesets",
+                  "Network firewall rules no longer apply to these targets, and Meraki does not "
+                  "document what an MX enforces for a policy without rulesets.",
+                  "Attach a ruleset (ending in an explicit deny where possible), or verify the "
+                  "behaviour with Security & SD-WAN > Appliance status > Tools > Firewall logging.",
+                  resource=f"policy {name}",
+                  item=f"Policy '{name}' is enforced on {_short(sorted(tg))}.")
+
+    for rs_id, rname in rs_name.items():
+        res = f"ruleset {rname}"
+        if not attached.get(rs_id):
+            s.add("INFO", "ORG-OGP-05", cat, "Org-wide firewall ruleset not used by any policy",
+                  "The ruleset is not attached to a policy, so it is not enforced.",
+                  "Attach it to a policy or delete it.", resource=res, item=f"Ruleset '{rname}':")
+            continue
+        rules = sorted(by_ruleset.get(rs_id, []), key=lambda r: r.get("priority") or 0)
+        if not rules:
+            s.add("HIGH", "ORG-OGP-02", cat, "Empty org-wide ruleset attached to a policy",
+                  "An empty ruleset attached to a policy is enforced as an allow-any-to-any rule "
+                  "(Meraki Org-wide Group Policy troubleshooting guide).",
+                  "Add rules to the ruleset or detach it.", resource=res,
+                  item=f"Ruleset '{rname}' (policy {where(rs_id)}):")
+            continue
+        disabled = [r.get("name") or r.get("ruleId") for r in rules if r.get("enabled") is False]
+        if disabled:
+            s.add("INFO", "ORG-OGP-07", cat, "Disabled org-wide firewall rules",
+                  "Disabled rules are not enforced and make the ruleset harder to review.",
+                  "Remove rules that are no longer needed.", resource=res,
+                  item=f"Ruleset '{rname}': {_short(disabled)}.")
+        active = [r for r in rules if r.get("enabled") is not False]
+        no_log = [r.get("name") or r.get("ruleId") for r in active
+                  if lower(r.get("policy")) == "deny" and not (r.get("logging") or {}).get("enabled")]
+        if no_log:
+            s.add("LOW", "ORG-OGP-06", cat, "Org-wide deny rules do not log",
+                  "Blocked traffic matching these rules leaves no syslog record.",
+                  "Enable logging on deny rules.", resource=res,
+                  item=f"Ruleset '{rname}': {_short(no_log)}.")
+        l3 = [ogp_as_l3(r) for r in active]
+        for idx, (r, m) in enumerate(zip(active, l3), 1):
+            if m and is_any_any_allow(m):
+                s.add("HIGH", "ORG-OGP-01", cat, "Any/any allow rule in org-wide ruleset",
+                      "It allows all traffic from every enforcement target of the policy, and the "
+                      "network firewall rules no longer apply to those targets.",
+                      "Remove or narrow the rule.", resource=f"{res} rule {idx}",
+                      item=f"Rule '{r.get('name') or '(no name)'}' in ruleset '{rname}' "
+                           f"(policy {where(rs_id)}):")
+        for j, later in enumerate(l3):
+            if later is None:
+                continue
+            for i in range(j):
+                earlier = l3[i]
+                if earlier is None or is_any_any_allow(earlier) or not rule_covers(earlier, later):
+                    continue
+                conflict = earlier["policy"] != later["policy"]
+                s.add("MEDIUM" if conflict else "INFO", "ORG-OGP-08", cat,
+                      "Org-wide rule never matches" + (" (conflicting earlier rule)" if conflict else ""),
+                      f"Rule {rule_label(j + 1, later)} in ruleset '{rname}' is fully covered by rule "
+                      f"{rule_label(i + 1, earlier)}, so its {later['policy']} never takes effect.",
+                      "Move the more specific rule above the broader one, or remove it.",
+                      resource=f"{res} rule {j + 1}")
+                break
+    return vlans
 
 
 def _who(a: dict) -> str:
@@ -1302,17 +1475,21 @@ def check_mx_l3_firewall(s: Scope) -> None:
         return
     cat = "Firewall"
     rules = [r for r in resp.get("rules", []) if lower(r.get("comment")) != "default rule"]
+    ogp = getattr(s, "ogp_vlans", None) or {}
+    note = (" These rules do not apply to VLAN(s) "
+            + ", ".join(f"{v} (org-wide policy '{p}')" for v, p in sorted(ogp.items()))
+            + "; see the ORG-OGP findings for those.") if ogp else ""
     if not any(lower(r.get("policy")) == "deny" for r in rules):
         s.add("LOW", "MX-FW-01", cat, "No outbound/inter-VLAN deny rules",
-              "The MX L3 firewall only relies on the default allow-any rule.",
+              "The MX L3 firewall only relies on the default allow-any rule." + note,
               "Implement egress filtering and inter-VLAN segmentation (deny by default where possible).")
     for idx, r in enumerate(rules, 1):
         if (lower(r.get("policy")) == "allow" and lower(r.get("protocol")) == "any"
                 and is_any(r.get("srcCidr")) and is_any(r.get("destCidr"))
                 and parse_ports(r.get("destPort")) is None):
-            s.add("MEDIUM", "MX-FW-02", cat, "Explicit any/any allow rule",
+            s.add("HIGH", "MX-FW-02", cat, "Explicit any/any allow rule",
                   f"Rule #{idx} '{r.get('comment') or '(no comment)'}' allows all traffic, making "
-                  "rules below it ineffective.",
+                  "rules below it ineffective." + note,
                   "Remove or narrow the rule.", resource=f"rule {idx}")
     report_shadowed(s, rules, "MX-FW-05", cat, "Firewall")
     no_comment = [str(i) for i, r in enumerate(rules, 1) if not r.get("comment")]
@@ -1769,8 +1946,10 @@ NETWORK_CHECKS: list[tuple[str | None, Callable[[Scope], None]]] = [
 ]
 
 
-def audit_network(dashboard, cfg: AuditConfig, out: Collector, org: dict, net: dict) -> None:
+def audit_network(dashboard, cfg: AuditConfig, out: Collector, org: dict, net: dict,
+                  ogp_vlans: dict[int, str] | None = None) -> None:
     s = Scope(dashboard, cfg, out, org, net)
+    s.ogp_vlans = ogp_vlans or {}
     products = set(net.get("productTypes", []))
     for product, fn in NETWORK_CHECKS:
         if product is None or product in products:
@@ -1798,6 +1977,11 @@ def audit_org(dashboard, cfg: AuditConfig, out: Collector, org: dict,
     check_org_snmp(s)
     check_third_party_vpn(s)
     check_vpn_firewall(s)
+    try:
+        ogp_vlans = check_org_group_policies(s)
+    except Exception as e:  # keep going on unexpected payloads
+        out.skip(Skipped(s.label, "check_org_group_policies", f"check failed: {type(e).__name__}: {e}"))
+        ogp_vlans = {}
 
     networks = s.call("networks", dashboard.organizations.getOrganizationNetworks,
                       org["id"], total_pages="all") or []
@@ -1816,7 +2000,8 @@ def audit_org(dashboard, cfg: AuditConfig, out: Collector, org: dict,
         check_switch_ports(s, names)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(audit_network, dashboard, cfg, out, org, n): n for n in networks}
+        futures = {pool.submit(audit_network, dashboard, cfg, out, org, n, ogp_vlans.get(n["id"])): n
+                   for n in networks}
         for fut in as_completed(futures):
             n = futures[fut]
             progress(f"  [net] {n.get('name')} {sorted(n.get('productTypes', []))}")
